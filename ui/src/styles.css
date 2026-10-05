@@ -174,9 +174,106 @@ tr:last-child td { border-bottom: none; }
 .waiting-strip { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: #edf2ff; color: #37438b; font-size: 13px; }
 .error-details { white-space: pre-wrap; overflow: auto; border-radius: 10px; background: #171a21; color: #f7f7f7; padding: 12px; font-size: 12px; }
 
+
+
+/* Opportunity selection: compact, searchable, and scalable for large Accounts. */
+.opportunity-context-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+.opportunity-context-row .alert { margin: 0; }
+
+.suggested-opportunity {
+    margin-top: 14px;
+    padding: 14px;
+    border: 1px solid #cfd5ff;
+    border-radius: 12px;
+    background: #f6f7ff;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+}
+.suggested-opportunity > div { display: grid; gap: 4px; min-width: 0; }
+.suggested-label {
+    color: #5252bd;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+}
+
+.opportunity-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin: 18px 0 12px;
+}
+.opportunity-search {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+}
+.opportunity-search input { min-width: 0; }
+
+.opportunity-list-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 4px 0 9px;
+    color: #697180;
+    font-size: 12px;
+}
+.opportunity-list {
+    border: 1px solid #e2e5ea;
+    border-radius: 12px;
+    overflow: hidden;
+}
+.opportunity-row {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(110px, .75fr) minmax(150px, .9fr) auto;
+    gap: 14px;
+    align-items: center;
+    padding: 12px 14px;
+    background: #fff;
+    border-bottom: 1px solid #edf0f3;
+}
+.opportunity-row:last-child { border-bottom: none; }
+.opportunity-row:hover { background: #fafaff; }
+.opportunity-row-main { display: grid; gap: 4px; min-width: 0; }
+.opportunity-row-main strong { overflow-wrap: anywhere; }
+.opportunity-row-date { display: grid; gap: 3px; }
+.opportunity-row-label {
+    color: #7b8190;
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+.opportunity-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 14px;
+    color: #697180;
+    font-size: 12px;
+}
+.opportunity-create-panel { margin-top: 12px; }
+
 @media (max-width: 700px) {
     .shell { padding: 10px; }
-    .grid.two, .choice-grid { grid-template-columns: 1fr; }
+    .grid.two, .choice-grid, .opportunity-context-row { grid-template-columns: 1fr; }
+    .opportunity-toolbar, .suggested-opportunity { align-items: stretch; flex-direction: column; }
+    .opportunity-search { flex-wrap: wrap; }
+    .opportunity-search input { flex: 1 1 100%; }
+    .opportunity-row { grid-template-columns: 1fr auto; gap: 8px 12px; }
+    .opportunity-row-date, .opportunity-row .record-id { grid-column: 1; }
+    .opportunity-row .button { grid-column: 2; grid-row: 1 / span 3; align-self: center; }
     .progress { grid-template-columns: repeat(3, 1fr); row-gap: 10px; }
     .progress-step::after { display: none; }
     .workspace-header { align-items: flex-start; }
@@ -190,6 +287,9 @@ tr:last-child td { border-bottom: none; }
     input, select, .button-secondary, .choice-card { background: #242933; color: #eef1f5; border-color: #454c58; }
     .choice-card:hover, .choice-card.selected { background: #2d2d4b; border-color: #8989ef; }
     .form-panel { background: #272c35; }
-    .product-card, .table-wrap, th, td { border-color: #3a404a; }
+    .product-card, .table-wrap, th, td, .opportunity-list, .opportunity-row { border-color: #3a404a; }
+    .opportunity-row { background: #20242c; }
+    .opportunity-row:hover { background: #292e38; }
+    .suggested-opportunity { background: #29294a; border-color: #5555a8; }
     .record-id { background: #303641; }
 }

@@ -870,7 +870,7 @@ function setFieldIfAllowed(target, fields, exactNames, fuzzyTokens, value) {
     return field.name;
 }
 
-async function discoverOpportunityData(requirements) {
+async function discoverOpportunityData(requirements, options = {}) {
     const accountName = requirements?.accountName;
     if (!accountName) {
         throw new Error("Account name is required for Opportunity discovery.");
@@ -882,17 +882,73 @@ async function discoverOpportunityData(requirements) {
             account: null,
             matchingAccounts: [],
             matchingOpportunities: [],
+            suggestedOpportunity: null,
+            opportunityPagination: {
+                page: 1,
+                pageSize: 10,
+                totalCount: 0,
+                totalPages: 0,
+                hasPrevious: false,
+                hasNext: false,
+                searchTerm: ""
+            },
             discoveryComplete: true,
             discoveryWarning: `No Salesforce Account named '${accountName}' was found.`
         };
     }
 
     const account = accounts[0];
+    const searchTerm = String(options.searchTerm || "").trim();
+    const requestedPageSize = Number(options.pageSize || 10);
+    const pageSize = Math.min(Math.max(Number.isFinite(requestedPageSize) ? requestedPageSize : 10, 5), 25);
+    const requestedPage = Number(options.page || 1);
+    const page = Math.max(Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 1, 1);
+
+    const whereParts = [`AccountId = '${escapeSoql(account.Id)}'`];
+    if (searchTerm) {
+        whereParts.push(`Name LIKE '%${escapeSoql(searchTerm)}%'`);
+    }
+    const whereClause = whereParts.join(" AND ");
+
+    const countRows = await soql(
+        `SELECT COUNT(Id) total FROM Opportunity WHERE ${whereClause}`
+    );
+    const totalCount = Number(countRows[0]?.total ?? countRows[0]?.expr0 ?? 0);
+    const totalPages = totalCount ? Math.ceil(totalCount / pageSize) : 0;
+    const safePage = totalPages ? Math.min(page, totalPages) : 1;
+    const offset = (safePage - 1) * pageSize;
+
+    // Salesforce SOQL OFFSET supports up to 2,000 rows. This UI is intended
+    // for hundreds of Account Opportunities; search keeps navigation practical
+    // well before that limit is reached.
     const opportunities = await soql(
         `SELECT Id, Name, StageName, CloseDate, AccountId, Account.Name, Pricebook2Id ` +
-        `FROM Opportunity WHERE AccountId = '${escapeSoql(account.Id)}' ` +
-        `ORDER BY LastModifiedDate DESC LIMIT 25`
+        `FROM Opportunity WHERE ${whereClause} ` +
+        `ORDER BY LastModifiedDate DESC, Id DESC LIMIT ${pageSize} OFFSET ${offset}`
     );
+
+    let suggestedOpportunity = null;
+    const mentionedOpportunityName = String(requirements?.opportunityName || "").trim();
+    if (mentionedOpportunityName) {
+        const suggestedRows = await soql(
+            `SELECT Id, Name, StageName, CloseDate, AccountId, Account.Name, Pricebook2Id ` +
+            `FROM Opportunity WHERE AccountId = '${escapeSoql(account.Id)}' ` +
+            `AND Name = '${escapeSoql(mentionedOpportunityName)}' ` +
+            `ORDER BY LastModifiedDate DESC LIMIT 1`
+        );
+        if (suggestedRows.length) {
+            const row = suggestedRows[0];
+            suggestedOpportunity = {
+                id: row.Id,
+                name: row.Name,
+                stageName: row.StageName,
+                closeDate: row.CloseDate,
+                accountId: row.AccountId,
+                accountName: row.Account?.Name || account.Name,
+                pricebookId: row.Pricebook2Id || null
+            };
+        }
+    }
 
     return {
         account: { id: account.Id, name: account.Name },
@@ -906,6 +962,16 @@ async function discoverOpportunityData(requirements) {
             accountName: row.Account?.Name || account.Name,
             pricebookId: row.Pricebook2Id || null
         })),
+        suggestedOpportunity,
+        opportunityPagination: {
+            page: safePage,
+            pageSize,
+            totalCount,
+            totalPages,
+            hasPrevious: safePage > 1,
+            hasNext: safePage < totalPages,
+            searchTerm
+        },
         defaultOpportunityStage: "Qualification",
         discoveryComplete: true,
         ...(accounts.length > 1
@@ -1132,6 +1198,9 @@ function registerWorkspaceActionTools(server) {
             inputSchema: z.object({
                 workflowId: z.string(),
                 requirements: z.record(z.string(), z.unknown()),
+                searchTerm: z.string().optional(),
+                page: z.number().int().positive().optional(),
+                pageSize: z.number().int().min(5).max(25).optional(),
                 carryForward: z.record(z.string(), z.unknown()).optional()
             }),
             annotations: {
@@ -1142,9 +1211,13 @@ function registerWorkspaceActionTools(server) {
             },
             _meta: appToolMeta()
         },
-        async ({ workflowId, requirements, carryForward }) => {
+        async ({ workflowId, requirements, searchTerm, page, pageSize, carryForward }) => {
             try {
-                const discovered = await discoverOpportunityData(requirements);
+                const discovered = await discoverOpportunityData(requirements, {
+                    searchTerm,
+                    page,
+                    pageSize
+                });
                 return {
                     content: [{ type: "text", text: "Opportunity discovery completed." }],
                     structuredContent: await saveWorkflowState({

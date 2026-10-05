@@ -296,6 +296,16 @@ export default function App() {
                     selection={selection}
                     busy={busy}
                     onUseExisting={chooseExistingOpportunity}
+                    onSearch={async ({ searchTerm, page, pageSize }) => {
+                        await callWorkspaceTool("workspace_discover_opportunities", {
+                            workflowId,
+                            requirements,
+                            searchTerm,
+                            page,
+                            pageSize,
+                            carryForward: workingData
+                        });
+                    }}
                     onCreate={async (newOpportunity) => {
                         patchSelection({ opportunityMode: "create", newOpportunity });
                         await callWorkspaceTool("workspace_create_opportunity", {
@@ -313,6 +323,7 @@ export default function App() {
                     summary={operationSummary}
                     fallbackRecord={selection.opportunity || salesforce.selectedOpportunity}
                     busy={busy}
+                    onBack={() => persistLocalView("opportunity")}
                     onContinue={async () => {
                         if (salesforce.quoteDiscoveryComplete) {
                             await persistLocalView("quote_config");
@@ -473,59 +484,99 @@ function RequirementsView({ requirements, nextActions, busy, onContinue }) {
     );
 }
 
-function OpportunityView({ requirements, salesforce, selection, busy, onUseExisting, onCreate }) {
+function OpportunityView({ requirements, salesforce, selection, busy, onUseExisting, onSearch, onCreate }) {
     const opportunities = salesforce.matchingOpportunities || [];
-    const [mode, setMode] = useState(selection.opportunityMode || "");
+    const pagination = salesforce.opportunityPagination || {
+        page: 1,
+        pageSize: 10,
+        totalCount: opportunities.length,
+        totalPages: opportunities.length ? 1 : 0,
+        hasPrevious: false,
+        hasNext: false,
+        searchTerm: ""
+    };
+    const suggestedOpportunity = salesforce.suggestedOpportunity || null;
+    const [mode, setMode] = useState(selection.opportunityMode === "create" ? "create" : "list");
+    const [searchTerm, setSearchTerm] = useState(pagination.searchTerm || "");
     const [name, setName] = useState(
         selection.newOpportunity?.name || requirements.opportunityName || `${requirements.accountName || "Account"} Opportunity`
     );
     const [stageName, setStageName] = useState(selection.newOpportunity?.stageName || salesforce.defaultOpportunityStage || "Qualification");
     const [closeDate, setCloseDate] = useState(selection.newOpportunity?.closeDate || requirements.startDate || "");
 
+    const visibleOpportunities = suggestedOpportunity
+        ? opportunities.filter((item) => item.id !== suggestedOpportunity.id)
+        : opportunities;
+
+    async function submitSearch(event) {
+        event?.preventDefault?.();
+        setMode("list");
+        await onSearch({ searchTerm: searchTerm.trim(), page: 1, pageSize: pagination.pageSize || 10 });
+    }
+
+    async function clearSearch() {
+        setSearchTerm("");
+        setMode("list");
+        await onSearch({ searchTerm: "", page: 1, pageSize: pagination.pageSize || 10 });
+    }
+
+    async function changePage(nextPage) {
+        await onSearch({
+            searchTerm: pagination.searchTerm || searchTerm.trim(),
+            page: nextPage,
+            pageSize: pagination.pageSize || 10
+        });
+    }
+
     return (
-        <Card title="Choose Opportunity" subtitle="An Opportunity name in the transcript is treated as a suggestion, not automatic approval.">
-            {requirements.opportunityName ? (
-                <Alert tone="info">Transcript mentioned: <strong>{requirements.opportunityName}</strong></Alert>
-            ) : null}
+        <Card title="Choose Opportunity" subtitle="Search and select an existing Salesforce Opportunity, or create a new one.">
+            <div className="opportunity-context-row">
+                {requirements.opportunityName ? (
+                    <Alert tone="info">Transcript mentioned: <strong>{requirements.opportunityName}</strong></Alert>
+                ) : null}
+                {salesforce.account?.name ? (
+                    <Alert tone="success">Salesforce Account found: <strong>{salesforce.account.name}</strong></Alert>
+                ) : null}
+            </div>
 
             {salesforce.discoveryWarning ? (
                 <Alert tone="warning">{salesforce.discoveryWarning}</Alert>
             ) : null}
 
-            {salesforce.account?.name ? (
-                <Alert tone="success">Salesforce Account found: <strong>{salesforce.account.name}</strong></Alert>
+            {suggestedOpportunity ? (
+                <div className="suggested-opportunity">
+                    <div>
+                        <span className="suggested-label">Transcript match</span>
+                        <strong>{suggestedOpportunity.name}</strong>
+                        <span>{suggestedOpportunity.stageName || suggestedOpportunity.stage || "Stage not provided"} · {niceDate(suggestedOpportunity.closeDate)}</span>
+                    </div>
+                    <Button disabled={busy} variant="primary" onClick={() => onUseExisting(suggestedOpportunity)}>Use Opportunity</Button>
+                </div>
             ) : null}
 
-            <div className="choice-grid">
-                {opportunities.map((opportunity) => (
-                    <button
-                        key={opportunity.id || opportunity.name}
-                        className="choice-card"
-                        type="button"
+            <div className="opportunity-toolbar">
+                <form className="opportunity-search" onSubmit={submitSearch}>
+                    <input
+                        aria-label="Search opportunities"
+                        value={searchTerm}
+                        onChange={(event) => setSearchTerm(event.target.value)}
+                        placeholder="Search opportunities by name..."
                         disabled={busy}
-                        onClick={() => onUseExisting(opportunity)}
-                    >
-                        <span className="choice-title">Use Existing Opportunity</span>
-                        <strong>{opportunity.name}</strong>
-                        <span>{opportunity.stageName || opportunity.stage || "Stage not provided"}</span>
-                        {opportunity.id ? <RecordId>{opportunity.id}</RecordId> : null}
-                    </button>
-                ))}
-
-                <button
-                    className={`choice-card ${mode === "create" ? "selected" : ""}`}
-                    type="button"
+                    />
+                    <Button type="submit" disabled={busy}>Search</Button>
+                    {pagination.searchTerm ? <Button type="button" disabled={busy} onClick={clearSearch}>Clear</Button> : null}
+                </form>
+                <Button
+                    variant="primary"
                     disabled={busy}
-                    onClick={() => setMode("create")}
+                    onClick={() => setMode((current) => current === "create" ? "list" : "create")}
                 >
-                    <span className="choice-title">Create New Opportunity</span>
-                    <strong>Use a new Salesforce Opportunity</strong>
-                    <span>You will confirm the fields before creation.</span>
-                </button>
+                    {mode === "create" ? "Back to Opportunities" : "Create New Opportunity"}
+                </Button>
             </div>
 
             {mode === "create" ? (
-                <div className="form-panel">
+                <div className="form-panel opportunity-create-panel">
                     <SectionTitle>New Opportunity</SectionTitle>
                     <label>
                         <span>Opportunity Name</span>
@@ -542,6 +593,7 @@ function OpportunityView({ requirements, salesforce, selection, busy, onUseExist
                         </label>
                     </div>
                     <div className="actions">
+                        <Button disabled={busy} onClick={() => setMode("list")}>Cancel</Button>
                         <Button
                             variant="primary"
                             disabled={busy || !name || !stageName || !closeDate}
@@ -551,23 +603,69 @@ function OpportunityView({ requirements, salesforce, selection, busy, onUseExist
                         </Button>
                     </div>
                 </div>
-            ) : null}
+            ) : (
+                <>
+                    <div className="opportunity-list-meta">
+                        <span>
+                            {pagination.totalCount
+                                ? `${pagination.totalCount} opportunit${pagination.totalCount === 1 ? "y" : "ies"}`
+                                : "No opportunities found"}
+                            {pagination.searchTerm ? ` matching “${pagination.searchTerm}”` : ""}
+                        </span>
+                        {pagination.totalPages > 1 ? <span>Page {pagination.page} of {pagination.totalPages}</span> : null}
+                    </div>
 
-            {!opportunities.length ? (
-                <Alert>No existing Opportunity was found for this Salesforce Account. You can create a new one.</Alert>
-            ) : null}
+                    <div className="opportunity-list" role="list">
+                        {visibleOpportunities.map((opportunity) => (
+                            <div className="opportunity-row" role="listitem" key={opportunity.id || opportunity.name}>
+                                <div className="opportunity-row-main">
+                                    <strong>{opportunity.name}</strong>
+                                    <span className="muted">{opportunity.stageName || opportunity.stage || "Stage not provided"}</span>
+                                </div>
+                                <div className="opportunity-row-date">
+                                    <span className="opportunity-row-label">Close date</span>
+                                    <strong>{niceDate(opportunity.closeDate)}</strong>
+                                </div>
+                                <RecordId>{opportunity.id}</RecordId>
+                                <Button disabled={busy} onClick={() => onUseExisting(opportunity)}>Use</Button>
+                            </div>
+                        ))}
+                    </div>
+
+                    {!visibleOpportunities.length ? (
+                        <Alert>
+                            {pagination.searchTerm
+                                ? "No Opportunities match this search. Try another name or create a new Opportunity."
+                                : "No existing Opportunity was found for this Salesforce Account. You can create a new one."}
+                        </Alert>
+                    ) : null}
+
+                    {(pagination.hasPrevious || pagination.hasNext) ? (
+                        <div className="opportunity-pagination">
+                            <Button disabled={busy || !pagination.hasPrevious} onClick={() => changePage(pagination.page - 1)}>Previous</Button>
+                            <span>Page {pagination.page}{pagination.totalPages ? ` of ${pagination.totalPages}` : ""}</span>
+                            <Button disabled={busy || !pagination.hasNext} onClick={() => changePage(pagination.page + 1)}>Next</Button>
+                        </div>
+                    ) : null}
+                </>
+            )}
         </Card>
     );
 }
 
-function OperationSummaryView({ summary, fallbackRecord, busy, onContinue }) {
+function OperationSummaryView({ summary, fallbackRecord, busy, onBack, onContinue }) {
     const record = summary.record || fallbackRecord || {};
     const title = summary.title || (summary.kind === "opportunity_created" ? "Opportunity Created" : "Opportunity Selected");
     return (
         <Card
             title={`✓ ${title}`}
             tone="success"
-            footer={<Button variant="primary" disabled={busy} onClick={onContinue}>{busy ? "Loading Quote Options…" : "Continue to Quote"}</Button>}
+            footer={
+                <>
+                    <Button disabled={busy} onClick={onBack}>Back</Button>
+                    <Button variant="primary" disabled={busy} onClick={onContinue}>{busy ? "Loading Quote Options…" : "Continue to Quote"}</Button>
+                </>
+            }
         >
             {summary.message ? <Alert tone="success">{summary.message}</Alert> : null}
             <div className="grid two">

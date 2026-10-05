@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useApp } from "@modelcontextprotocol/ext-apps/react";
 import {
     Alert,
@@ -103,6 +103,17 @@ export default function App() {
     const [workingData, setWorkingData] = useState({});
     const [busy, setBusy] = useState(false);
     const [errorMessage, setErrorMessage] = useState("");
+    const hydratedWorkflows = useRef(new Set());
+
+    function applyStructuredPayload(structured) {
+        if (!structured || typeof structured !== "object") return;
+        const next = clone(structured);
+        setPayload((current) => ({ ...current, ...next }));
+        if (next.view) setView(next.view);
+        setWorkingData((current) => mergeWorkspaceData(current, next.data || {}));
+        setErrorMessage("");
+        setBusy(false);
+    }
 
     const { app, isConnected, error } = useApp({
         appInfo: { name: "Salesforce Revenue Workspace", version: "3.0.0" },
@@ -110,14 +121,29 @@ export default function App() {
         onAppCreated: (createdApp) => {
             createdApp.ontoolresult = (result) => {
                 const structured = result?.structuredContent;
-                if (structured && typeof structured === "object") {
-                    const next = clone(structured);
-                    setPayload((current) => ({ ...current, ...next }));
-                    setView(next.view || "requirements");
-                    setWorkingData((current) => mergeWorkspaceData(current, next.data || {}));
-                    setErrorMessage("");
-                    setBusy(false);
-                }
+                if (!structured || typeof structured !== "object") return;
+
+                applyStructuredPayload(structured);
+
+                const id = structured.workflowId;
+                if (!id || hydratedWorkflows.current.has(id)) return;
+
+                hydratedWorkflows.current.add(id);
+
+                // The host recreates an MCP App from the ORIGINAL tool result when
+                // a chat is reopened. Immediately replace that snapshot with the
+                // latest server-persisted workflow state.
+                void createdApp.callServerTool({
+                    name: "workspace_get_state",
+                    arguments: { workflowId: id }
+                }).then((savedResult) => {
+                    const saved = savedResult?.structuredContent;
+                    if (saved && typeof saved === "object") {
+                        applyStructuredPayload(saved);
+                    }
+                }).catch((restoreError) => {
+                    console.warn("Could not restore Revenue Workspace state", restoreError);
+                });
             };
         }
     });
@@ -154,10 +180,7 @@ export default function App() {
 
             const structured = result?.structuredContent;
             if (structured && typeof structured === "object") {
-                const next = clone(structured);
-                setPayload((current) => ({ ...current, ...next }));
-                if (next.view) setView(next.view);
-                setWorkingData((current) => mergeWorkspaceData(current, next.data || {}));
+                applyStructuredPayload(structured);
             }
 
             setBusy(false);
@@ -166,6 +189,30 @@ export default function App() {
             setErrorMessage(toolError?.message || String(toolError));
             setBusy(false);
             throw toolError;
+        }
+    }
+
+    async function persistLocalView(nextView, patch = {}) {
+        const nextData = mergeWorkspaceData(workingData, patch);
+        setWorkingData(nextData);
+        setView(nextView);
+
+        try {
+            const result = await app.callServerTool({
+                name: "workspace_save_state",
+                arguments: {
+                    workflowId,
+                    view: nextView,
+                    data: nextData
+                }
+            });
+
+            const structured = result?.structuredContent;
+            if (structured && typeof structured === "object") {
+                applyStructuredPayload(structured);
+            }
+        } catch (saveError) {
+            setErrorMessage(`The current step could not be persisted: ${saveError?.message || String(saveError)}`);
         }
     }
 
@@ -179,13 +226,17 @@ export default function App() {
         }));
     }
 
-    function chooseExistingOpportunity(opportunity) {
-        patchSelection({
-            opportunityMode: "existing",
-            opportunity
-        });
-        setWorkingData((current) => ({
-            ...current,
+    async function chooseExistingOpportunity(opportunity) {
+        await persistLocalView("opportunity_summary", {
+            selection: {
+                ...selection,
+                opportunityMode: "existing",
+                opportunity
+            },
+            salesforce: {
+                ...salesforce,
+                selectedOpportunity: opportunity
+            },
             operationSummary: {
                 kind: "opportunity_selected",
                 success: true,
@@ -193,8 +244,7 @@ export default function App() {
                 message: "This existing Opportunity will be used for the quote.",
                 record: opportunity
             }
-        }));
-        setView("opportunity_summary");
+        });
     }
 
     if (error) {
@@ -226,7 +276,7 @@ export default function App() {
                     busy={busy}
                     onContinue={async () => {
                         if (salesforce.discoveryComplete) {
-                            setView("opportunity");
+                            await persistLocalView("opportunity");
                             return;
                         }
 
@@ -265,7 +315,7 @@ export default function App() {
                     busy={busy}
                     onContinue={async () => {
                         if (salesforce.quoteDiscoveryComplete) {
-                            setView("quote_config");
+                            await persistLocalView("quote_config");
                             return;
                         }
 
@@ -289,22 +339,20 @@ export default function App() {
                     requirements={requirements}
                     salesforce={salesforce}
                     selection={selection}
-                    onBack={() => setView("opportunity_summary")}
-                    onContinue={(quote) => {
-                        patchSelection({ quote });
-                        setView("products");
-                    }}
+                    onBack={() => persistLocalView("opportunity_summary")}
+                    onContinue={(quote) => persistLocalView("products", {
+                        selection: { ...selection, quote }
+                    })}
                 />
             ) : null}
 
             {view === "products" ? (
                 <ProductsView
                     products={products}
-                    onBack={() => setView("quote_config")}
-                    onContinue={(nextProducts) => {
-                        patchSelection({ products: nextProducts });
-                        setView("review");
-                    }}
+                    onBack={() => persistLocalView("quote_config")}
+                    onContinue={(nextProducts) => persistLocalView("review", {
+                        selection: { ...selection, products: nextProducts }
+                    })}
                 />
             ) : null}
 
@@ -315,7 +363,7 @@ export default function App() {
                     selection={selection}
                     products={products}
                     busy={busy}
-                    onBack={() => setView("products")}
+                    onBack={() => persistLocalView("products")}
                     onCreateQuote={() =>
                         callWorkspaceTool("workspace_create_quote", {
                             workflowId,
@@ -341,7 +389,7 @@ export default function App() {
                             await app.openLink({ url: operationSummary.recordUrl });
                         }
                     }}
-                    onContinue={() => setView("final_summary")}
+                    onContinue={() => persistLocalView("final_summary")}
                 />
             ) : null}
 

@@ -41,6 +41,49 @@ const TOKEN_DIRECTORY = path.join(
 
 const TOKEN_FILE = path.join(TOKEN_DIRECTORY, "tokens.json");
 
+// Persist Revenue Workspace progress outside the React iframe so the latest
+// step survives chat navigation, iframe reloads, Claude restarts, and refreshes.
+const WORKFLOW_DIRECTORY = path.join(TOKEN_DIRECTORY, "workflow-state");
+
+function workflowStateFile(workflowId) {
+    const safeId = String(workflowId || "")
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]/g, "_");
+
+    if (!safeId) {
+        throw new Error("workflowId is required for Revenue Workspace persistence.");
+    }
+
+    return path.join(WORKFLOW_DIRECTORY, `${safeId}.json`);
+}
+
+async function saveWorkflowState(payload) {
+    if (!payload?.workflowId) return payload;
+
+    await fs.mkdir(WORKFLOW_DIRECTORY, { recursive: true });
+
+    const file = workflowStateFile(payload.workflowId);
+    const temp = `${file}.${process.pid}.tmp`;
+    const stored = {
+        ...payload,
+        savedAt: new Date().toISOString()
+    };
+
+    await fs.writeFile(temp, JSON.stringify(stored, null, 2), "utf8");
+    await fs.rename(temp, file);
+    return stored;
+}
+
+async function readWorkflowState(workflowId) {
+    try {
+        const raw = await fs.readFile(workflowStateFile(workflowId), "utf8");
+        return JSON.parse(raw);
+    } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+    }
+}
+
 /* =========================================================
    ERROR HELPERS
    ========================================================= */
@@ -491,6 +534,13 @@ async function callRemoteTool(remote, toolName, args) {
 }
 
 async function testRemoteConnection(remote) {
+    // A remote can be optional at startup. If it is not connected yet,
+    // try to connect now instead of failing with a null-client error.
+    if (!remote.client) {
+        const connection = await connectRemote(remote);
+        return connection.tools;
+    }
+
     try {
         const result = await remote.client.listTools();
         remote.tools = result.tools;
@@ -516,20 +566,40 @@ async function testRemoteConnection(remote) {
 
 /* =========================================================
    INITIAL CONNECTIONS
+
+   Headless 360 is required because the Revenue Workspace, transcript
+   metadata lookup, Opportunity discovery, and quote workflow use it.
+
+   Revenue Cloud Tools is optional at startup. If that custom MCP
+   endpoint is temporarily unavailable, do NOT kill the whole local MCP
+   server; otherwise Claude loses read_account_transcript and all of the
+   Revenue Workspace tools as well.
    ========================================================= */
 
 try {
     await connectRemote(headless360);
-    await connectRemote(revenueCloud);
 } catch (error) {
     console.error("");
-    console.error("Unable to establish the initial Salesforce MCP connections.");
+    console.error("Unable to establish the required Salesforce Headless 360 connection.");
     console.error(error?.message ?? error);
     console.error("");
     console.error("If Salesforce authentication expired, close Claude and run:");
     console.error("node --env-file=.env salesforce-auth.js");
     console.error("");
     throw error;
+}
+
+try {
+    await connectRemote(revenueCloud);
+} catch (error) {
+    revenueCloud.client = null;
+    revenueCloud.tools = [];
+    console.error("");
+    console.error("WARNING: Salesforce Revenue Cloud Tools is unavailable right now.");
+    console.error(error?.message ?? error);
+    console.error("The local MCP server will continue with Headless 360, the Account transcript reader, and Revenue Workspace tools.");
+    console.error("Revenue Cloud Tools can be retried later with test_connection or after restarting Claude Desktop.");
+    console.error("");
 }
 
 /* =========================================================
@@ -982,6 +1052,77 @@ function appToolMeta() {
 }
 
 function registerWorkspaceActionTools(server) {
+    // The app hydrates from this tool whenever Claude recreates the iframe.
+    // This is what lets an old chat reopen directly on the last completed step.
+    registerAppTool(
+        server,
+        "workspace_get_state",
+        {
+            title: "Restore Revenue Workspace State",
+            description: "Restore the latest persisted state for an existing Revenue Workspace workflow.",
+            inputSchema: z.object({
+                workflowId: z.string().min(1)
+            }),
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+            },
+            _meta: appToolMeta()
+        },
+        async ({ workflowId }) => {
+            const saved = await readWorkflowState(workflowId);
+
+            if (!saved) {
+                return {
+                    content: [{ type: "text", text: "No persisted Revenue Workspace state exists yet." }],
+                    structuredContent: null
+                };
+            }
+
+            return {
+                content: [{ type: "text", text: `Restored Revenue Workspace state: ${saved.view}` }],
+                structuredContent: saved
+            };
+        }
+    );
+
+    // Local UI-only transitions (for example Products -> Review or Quote Summary
+    // -> Final Summary) never touch Salesforce, but they still need persistence.
+    registerAppTool(
+        server,
+        "workspace_save_state",
+        {
+            title: "Save Revenue Workspace State",
+            description: "Persist the current Revenue Workspace UI step and data without modifying Salesforce.",
+            inputSchema: z.object({
+                workflowId: z.string().min(1),
+                view: z.enum(workspaceViews),
+                data: z.record(z.string(), z.unknown())
+            }),
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+            },
+            _meta: appToolMeta()
+        },
+        async ({ workflowId, view, data }) => {
+            const payload = await saveWorkflowState({
+                version: 4,
+                workflowId,
+                view,
+                data
+            });
+
+            return {
+                content: [{ type: "text", text: `Revenue Workspace state saved: ${view}` }],
+                structuredContent: payload
+            };
+        }
+    );
     registerAppTool(
         server,
         "workspace_discover_opportunities",
@@ -1006,8 +1147,8 @@ function registerWorkspaceActionTools(server) {
                 const discovered = await discoverOpportunityData(requirements);
                 return {
                     content: [{ type: "text", text: "Opportunity discovery completed." }],
-                    structuredContent: {
-                        version: 3,
+                    structuredContent: await saveWorkflowState({
+                        version: 4,
                         view: "opportunity",
                         workflowId,
                         data: {
@@ -1018,14 +1159,14 @@ function registerWorkspaceActionTools(server) {
                                 ...discovered
                             }
                         }
-                    }
+                    })
                 };
             } catch (error) {
                 return {
                     isError: true,
                     content: [{ type: "text", text: error?.message || String(error) }],
-                    structuredContent: {
-                        version: 3,
+                    structuredContent: await saveWorkflowState({
+                        version: 4,
                         view: "error",
                         workflowId,
                         data: {
@@ -1036,7 +1177,7 @@ function registerWorkspaceActionTools(server) {
                                 message: error?.message || String(error)
                             }
                         }
-                    }
+                    })
                 };
             }
         }
@@ -1102,8 +1243,8 @@ function registerWorkspaceActionTools(server) {
 
                 return {
                     content: [{ type: "text", text: `Opportunity created: ${record.name}` }],
-                    structuredContent: {
-                        version: 3,
+                    structuredContent: await saveWorkflowState({
+                        version: 4,
                         view: "opportunity_summary",
                         workflowId,
                         data: {
@@ -1127,7 +1268,7 @@ function registerWorkspaceActionTools(server) {
                                 record
                             }
                         }
-                    }
+                    })
                 };
             } catch (error) {
                 return {
@@ -1164,8 +1305,8 @@ function registerWorkspaceActionTools(server) {
                 const discovered = await discoverQuoteContext({ requirements, account, opportunity });
                 return {
                     content: [{ type: "text", text: "Quote configuration discovery completed." }],
-                    structuredContent: {
-                        version: 3,
+                    structuredContent: await saveWorkflowState({
+                        version: 4,
                         view: "quote_config",
                         workflowId,
                         data: {
@@ -1180,7 +1321,7 @@ function registerWorkspaceActionTools(server) {
                                 opportunity: discovered.selectedOpportunity
                             }
                         }
-                    }
+                    })
                 };
             } catch (error) {
                 return {
@@ -1333,8 +1474,8 @@ function registerWorkspaceActionTools(server) {
 
                 return {
                     content: [{ type: "text", text: `Quote created: ${savedQuote.Name}` }],
-                    structuredContent: {
-                        version: 3,
+                    structuredContent: await saveWorkflowState({
+                        version: 4,
                         view: "quote_summary",
                         workflowId,
                         data: {
@@ -1367,7 +1508,7 @@ function registerWorkspaceActionTools(server) {
                                 recordUrl
                             }
                         }
-                    }
+                    })
                 };
             } catch (error) {
                 return {
@@ -1378,7 +1519,7 @@ function registerWorkspaceActionTools(server) {
         }
     );
 
-    console.error("Registered app-only Revenue Workspace action tools.");
+    console.error("Registered app-only Revenue Workspace action + persistence tools.");
 }
 
 function registerRevenueWorkspaceApp(server) {
@@ -1452,6 +1593,8 @@ function registerRevenueWorkspaceApp(server) {
                 }
             };
 
+            const persistedPayload = await saveWorkflowState(payload);
+
             return {
                 content: [
                     {
@@ -1459,7 +1602,7 @@ function registerRevenueWorkspaceApp(server) {
                         text: "Interactive Salesforce Revenue Workspace rendered. Do not restate the requirements or ask a follow-up question in prose; the user should continue in the UI."
                     }
                 ],
-                structuredContent: payload
+                structuredContent: persistedPayload
             };
         }
     );
@@ -1487,12 +1630,12 @@ function registerRevenueWorkspaceApp(server) {
             }
         },
         async ({ view, workflowId, data }) => {
-            const payload = {
-                version: 2,
+            const payload = await saveWorkflowState({
+                version: 4,
                 view,
                 workflowId: workflowId || `wf-${Date.now()}`,
                 data
-            };
+            });
 
             return {
                 content: [
@@ -1611,7 +1754,7 @@ function createServer() {
         },
         async () => {
             const results = [];
-            let failed = false;
+            let requiredFailed = false;
 
             for (const remote of [headless360, revenueCloud]) {
                 try {
@@ -1622,15 +1765,16 @@ function createServer() {
                             .join(", ") || "none"}`
                     );
                 } catch (error) {
-                    failed = true;
+                    const optional = remote === revenueCloud;
+                    if (!optional) requiredFailed = true;
                     results.push(
-                        `${remote.label}: FAILED - ${error?.message ?? error}`
+                        `${remote.label}: ${optional ? "OPTIONAL FAILED" : "FAILED"} - ${error?.message ?? error}`
                     );
                 }
             }
 
             return {
-                ...(failed ? { isError: true } : {}),
+                ...(requiredFailed ? { isError: true } : {}),
                 content: [
                     {
                         type: "text",
@@ -1681,6 +1825,6 @@ function createServer() {
 }
 
 console.error(
-    "Salesforce dual MCP bridge ready: Headless 360 + Revenue Cloud Tools."
+    `Salesforce MCP bridge ready: Headless 360 connected; Revenue Cloud Tools ${revenueCloud.client ? "connected" : "currently unavailable (optional)"}.`
 );
 void serveStdio(createServer);

@@ -938,7 +938,7 @@ async function analyzeAccountInsights(requirements) {
             productName,
             productFamily,
             status: current ? "CURRENT" : "PREVIOUSLY_USED",
-            statusLabel: current ? "Currently used" : "Previously used",
+            statusLabel: current ? "Current Asset" : "Previously used",
             requested: Boolean(requested),
             requestedQuantity: requested?.quantity ?? null,
             explicitlyExcluded: excluded,
@@ -1067,6 +1067,28 @@ async function analyzeAccountInsights(requirements) {
             continue;
         }
 
+        if (!item.requested && item.status === "CURRENT" && item.trend?.direction === "GROWING") {
+            addRecommendation({
+                id: buildRecommendationId("GROWING_USAGE_OPPORTUNITY", item.productName),
+                type: "GROWING_USAGE_OPPORTUNITY",
+                priority: "HIGH",
+                label: "Growing usage: optional expansion",
+                title: `Consider ${item.productName} expansion`,
+                product: { id: item.productId, name: item.productName },
+                requestedByCustomer: false,
+                canAddToRequest: true,
+                aeInsight: `${item.productName} has growing recorded usage but was not requested in this quote. AE may discuss additional capacity; growth alone does not prove the customer needs to buy more.`,
+                customerTalkingPoint: `Your ${item.productName} usage has grown recently. Would additional capacity be useful for your planned expansion?`,
+                evidence: [
+                    item.lastUsagePeriod ? `Latest usage period: ${item.lastUsagePeriod}` : null,
+                    item.lastUsageAmount !== null ? `Latest recorded usage: ${item.lastUsageAmount}` : null,
+                    item.trend?.percentChange !== null ? `Recent usage change: +${item.trend.percentChange}%` : null,
+                    "Not in the current customer request"
+                ].filter(Boolean)
+            });
+            continue;
+        }
+
         if (!item.requested && item.status === "CURRENT" && item.trend?.direction === "DECLINING") {
             addRecommendation({
                 id: buildRecommendationId("USAGE_CHANGE", item.productName),
@@ -1077,7 +1099,7 @@ async function analyzeAccountInsights(requirements) {
                 product: { id: item.productId, name: item.productName },
                 requestedByCustomer: false,
                 canAddToRequest: false,
-                aeInsight: `${item.productName} is currently used, but recent usage has declined materially.`,
+                aeInsight: `${item.productName} is currently a Asset, but recent usage has declined materially.`,
                 customerTalkingPoint: `We've seen ${item.productName} usage change recently. Has your usage pattern changed, or should we plan for a different level going forward?`,
                 evidence: [
                     item.lastUsageAmount !== null ? `Latest usage amount: ${item.lastUsageAmount}` : null,
@@ -1152,11 +1174,11 @@ async function analyzeAccountInsights(requirements) {
             currentProducts: history.filter(item => item.status === "CURRENT").length,
             previousProducts: history.filter(item => item.status === "PREVIOUSLY_USED").length,
             newRequestedProducts: history.filter(item => item.status === "NEVER_USED" && item.requested).length,
-            recommendations: Math.min(recommendations.length, 5),
+            recommendations: Math.min(recommendations.length, 12),
             suppressedByExplicitExclusion: history.filter(item => item.explicitlyExcluded).length
         },
         productHistory: history,
-        recommendations: recommendations.slice(0, 5),
+        recommendations: recommendations.slice(0, 12),
         analysisNote: raw.recordCount
             ? "Recommendations are grounded in Product Usage history plus the current customer request. No Salesforce records were modified."
             : "No Product Usage records were found for this account. Requested products are shown as new-service context only."
@@ -1510,6 +1532,277 @@ async function discoverQuoteContext({ requirements, account, opportunity }) {
         products: productRows,
         quoteDiscoveryComplete: true
     };
+}
+
+
+// Read-only catalog search scoped to the selected quote Price Book.
+async function searchWorkspaceProducts({ pricebookId, searchTerm = "", limit = 30 }) {
+    if (!/^[a-zA-Z0-9]{15,18}$/.test(String(pricebookId || ""))) {
+        throw new Error("Select a valid Salesforce Price Book before searching products.");
+    }
+    const safeLimit = Math.min(Math.max(Math.floor(Number(limit) || 30), 1), 50);
+    const term = String(searchTerm || "").trim();
+    if (term.length > 100) throw new Error("Product search must be 100 characters or fewer.");
+    const pbeDescribe = await describeSObject("PricebookEntry");
+    const fields = Array.isArray(pbeDescribe?.fields) ? pbeDescribe.fields : [];
+    const modelFields = fields.filter(field => /selling\s*model/i.test(`${field.name || ""} ${field.label || ""}`));
+    const queryFields = ["Id", "Product2Id", "Product2.Name", "Product2.ProductCode", "UnitPrice", "IsActive"];
+    if (fields.some(field => field.name === "CurrencyIsoCode")) queryFields.push("CurrencyIsoCode");
+    for (const field of modelFields) {
+        if (!queryFields.includes(field.name)) queryFields.push(field.name);
+        if (field.relationshipName) queryFields.push(`${field.relationshipName}.Name`);
+    }
+    const searchWhere = term
+        ? ` AND (Product2.Name LIKE '%${escapeSoql(term)}%' OR Product2.ProductCode LIKE '%${escapeSoql(term)}%')`
+        : "";
+    const entries = await soql(
+        `SELECT ${queryFields.join(", ")} FROM PricebookEntry ` +
+        `WHERE Pricebook2Id = '${escapeSoql(pricebookId)}' AND IsActive = true AND Product2.IsActive = true` +
+        searchWhere + ` ORDER BY Product2.Name ASC LIMIT ${Math.min(safeLimit * 5, 200)}`
+    );
+    const productsById = new Map();
+    for (const entry of entries) {
+        if (!entry.Product2Id) continue;
+        let modelLabel = null;
+        let modelId = null;
+        for (const field of modelFields) {
+            if (entry[field.name]) modelId = entry[field.name];
+            if (field.relationshipName && entry[field.relationshipName]?.Name) modelLabel = entry[field.relationshipName].Name;
+        }
+        const model = {
+            label: modelLabel || "Available Pricebook Entry",
+            value: entry.Id,
+            pricebookEntryId: entry.Id,
+            sellingModelId: modelId,
+            unitPrice: Number(entry.UnitPrice),
+            currency: entry.CurrencyIsoCode || "USD"
+        };
+        if (!productsById.has(entry.Product2Id)) {
+            productsById.set(entry.Product2Id, {
+                productId: entry.Product2Id,
+                name: entry.Product2?.Name || "Unknown Product",
+                productCode: entry.Product2?.ProductCode || "",
+                quantity: 1,
+                currency: model.currency,
+                unitPrice: model.unitPrice,
+                pricebookEntryId: entry.Id,
+                matchStatus: "matched",
+                sellingModels: [],
+                selectedSellingModel: model,
+                selectedSellingModelValue: entry.Id
+            });
+        }
+        productsById.get(entry.Product2Id).sellingModels.push(model);
+        if (productsById.size >= safeLimit && !productsById.has(entry.Product2Id)) break;
+    }
+    return [...productsById.values()].slice(0, safeLimit);
+}
+
+function validateQuoteLineDiscount(product, unitPrice, quantity) {
+    const discountType = product.discountType || "percent";
+    const value = Number(product.discountValue ?? 0);
+    if (!["percent", "amount"].includes(discountType)) throw new Error(`Invalid discount type for ${product.name}.`);
+    if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid discount for ${product.name}.`);
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new Error(`Invalid unit price for ${product.name}.`);
+    if (!Number.isFinite(quantity) || !Number.isInteger(quantity) || quantity <= 0) throw new Error(`Invalid quantity for ${product.name}.`);
+    const subtotal = unitPrice * quantity;
+    if (discountType === "percent" && value > 100) throw new Error(`Discount cannot exceed 100% for ${product.name}.`);
+    if (discountType === "amount" && value > subtotal) throw new Error(`Discount cannot exceed line subtotal for ${product.name}.`);
+    const amount = discountType === "amount" ? value : subtotal * value / 100;
+    // QuoteLineItem.Discount is a percentage, including when AE enters a fixed line amount.
+    const percent = subtotal === 0 ? 0 : amount * 100 / subtotal;
+    return { type: discountType, value, amount, percent, subtotal };
+}
+
+
+/* =========================================================
+   AI RECOMMENDATIONS: CLAUDE DESKTOP HOST + VERIFIED CATALOG
+   ========================================================= */
+const recommendationPriority = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+const recommendationKinds = new Set(["ALTERNATIVE", "COMPLEMENTARY", "CROSS_SELL", "EXPANSION", "REACTIVATION", "COEXISTENCE"]);
+function productKey(name) { return normalizeInsightText(name).replace(/\b(volume|usage)\s+tiers?\b/g, "").trim(); }
+function quoteSelectedProducts(data) {
+    return Array.isArray(data?.selection?.products) && data.selection.products.length
+        ? data.selection.products : (data?.salesforce?.products || data?.requirements?.products || []);
+}
+function isExplicitlyExcluded(name, exclusions) {
+    return (exclusions || []).some(ex => normalizeInsightText(ex) === normalizeInsightText(name));
+}
+function catalogRelevance(row, selections) {
+    const name = normalizeInsightText(row.name);
+    const tokens = new Set(name.split(" ").filter(x => x.length > 3));
+    let result = 0;
+    for (const requested of selections) {
+        const other = normalizeInsightText(requested.name);
+        if (name === other) return 0;
+        if (productKey(name) && productKey(name) === productKey(other)) result = Math.max(result, 100);
+        const shared = other.split(" ").filter(token => token.length > 3 && tokens.has(token)).length;
+        result = Math.max(result, shared * 12);
+        if (/\bvoice\b/.test(other) && /\bsupport\b/.test(name)) result = Math.max(result, 25);
+        if (/sendgrid|email/.test(other) && /support/.test(name)) result = Math.max(result, 25);
+    }
+    return result;
+}
+/* Only products used by the chosen Account AND assigned to this catalog may be recommended. */
+const RECOMMENDATION_CATALOG_NAME = process.env.RECOMMENDATION_CATALOG_NAME || "Agent Productivity Catalog";
+
+async function getCatalogProductIds() {
+    const catalogs = await soql(
+        `SELECT Id, Name FROM ProductCatalog WHERE Name = '${escapeSoql(RECOMMENDATION_CATALOG_NAME)}' LIMIT 2`
+    );
+    if (catalogs.length !== 1) {
+        throw new Error(`Expected exactly one Salesforce Product Catalog named '${RECOMMENDATION_CATALOG_NAME}', found ${catalogs.length}. Check the catalog name and access.`);
+    }
+    const catalogId = catalogs[0].Id;
+    const junctionDescription = await describeSObject("ProductCategoryProduct");
+    const fields = new Set((junctionDescription.fields || []).map(f => f.name));
+    if (!fields.has("ProductId")) throw new Error("ProductCategoryProduct.ProductId is not available to this Salesforce user.");
+    let memberships;
+    if (fields.has("CatalogId")) {
+        memberships = await soql(`SELECT ProductId FROM ProductCategoryProduct WHERE CatalogId = '${escapeSoql(catalogId)}' LIMIT 2000`);
+    } else {
+        const categories = await soql(`SELECT Id FROM ProductCategory WHERE CatalogId = '${escapeSoql(catalogId)}' LIMIT 2000`);
+        if (!categories.length) return { catalogId, productIds: new Set() };
+        const ids = categories.map(c => `'${escapeSoql(c.Id)}'`).join(",");
+        memberships = await soql(`SELECT ProductId FROM ProductCategoryProduct WHERE ProductCategoryId IN (${ids}) LIMIT 2000`);
+    }
+    return { catalogId, productIds: new Set(memberships.map(m => m.ProductId).filter(Boolean)) };
+}
+
+async function buildRecommendationContext(data, pricebookId) {
+    if (!/^[a-zA-Z0-9]{15,18}$/.test(String(pricebookId || ""))) throw new Error("A valid Price Book ID is required.");
+    const accountId = data?.salesforce?.account?.id || data?.salesforce?.accountInsights?.account?.id;
+    if (!/^[a-zA-Z0-9]{15,18}$/.test(String(accountId || ""))) throw new Error("Select and analyze a Salesforce Account before recommending products.");
+    const selected = quoteSelectedProducts(data).map(p => ({
+        id: p.productId || null, name: String(p.name || ""), quantity: Number(p.quantity) || 1
+    }));
+    const excluded = data?.requirements?.excluded || data?.requirements?.excludedProducts || [];
+    // Fresh read scoped by Account ID, not an account name or historical UI snapshot.
+    const usageRows = await soql(
+        `SELECT Id, Product__c, Product__r.Name, Usage_Amount__c, Month__c, Year__c ` +
+        `FROM Product_Usage__c WHERE Account__c = '${escapeSoql(accountId)}' ` +
+        `ORDER BY Year__c DESC, Month__c DESC LIMIT 2000`
+    );
+    const { catalogId, productIds: catalogIds } = await getCatalogProductIds();
+    const usageByProduct = new Map();
+    for (const row of usageRows) {
+        if (!row.Product__c || !catalogIds.has(row.Product__c)) continue;
+        if (!usageByProduct.has(row.Product__c)) usageByProduct.set(row.Product__c, []);
+        usageByProduct.get(row.Product__c).push({
+            usageAmount: row.Usage_Amount__c == null ? null : Number(row.Usage_Amount__c),
+            month: Number(row.Month__c), year: Number(row.Year__c),
+            productName: row.Product__r?.Name || ""
+        });
+    }
+    const ids = [...usageByProduct.keys()];
+    const allLatest = Math.max(-1, ...usageRows.map(r => usagePeriodIndex(r.Year__c, r.Month__c) ?? -1));
+    const candidates = [];
+    if (ids.length) {
+        // Chunk the IN clause so the query stays compact for larger accounts.
+        for (let offset = 0; offset < ids.length; offset += 150) {
+            const chunk = ids.slice(offset, offset + 150).map(id => `'${escapeSoql(id)}'`).join(",");
+            const entries = await soql(
+                `SELECT Id, Product2Id, Product2.Name, Product2.ProductCode, Product2.Family, Product2.Description, UnitPrice ` +
+                `FROM PricebookEntry WHERE Pricebook2Id = '${escapeSoql(pricebookId)}' ` +
+                `AND Product2Id IN (${chunk}) AND IsActive = true AND Product2.IsActive = true LIMIT 2000`
+            );
+            const seen = new Set(candidates.map(x => x.productId));
+            for (const e of entries) {
+                const name = e.Product2?.Name || "";
+                if (seen.has(e.Product2Id) || productIsExplicitlyExcluded(name, e.Product2?.Family, excluded)) continue;
+                if (selected.some(p => p.id === e.Product2Id || normalizeInsightText(p.name) === normalizeInsightText(name))) continue;
+                const raw = usageByProduct.get(e.Product2Id) || [];
+                const ordered = raw.filter(r => usagePeriodIndex(r.year, r.month) !== null)
+                    .sort((x, y) => usagePeriodIndex(x.year, x.month) - usagePeriodIndex(y.year, y.month));
+                if (!ordered.length) continue;
+                const latest = ordered[ordered.length - 1];
+                const trend = calculateUsageTrend(ordered);
+                const latestPeriod = usagePeriodIndex(latest.year, latest.month);
+                const currentlyUsed = allLatest >= 0 && latestPeriod === allLatest;
+                const usageAmount = latest.usageAmount ?? 0;
+                const score = (currentlyUsed ? 25 : 0) + (trend.direction === "GROWING" ? 40 : 0) +
+                    (usageAmount > 500 ? 25 : 0) + (ordered.length > 1 ? 10 : 0);
+                candidates.push({
+                    productId: e.Product2Id, pricebookEntryId: e.Id, name,
+                    productCode: e.Product2?.ProductCode || "", family: e.Product2?.Family || "",
+                    description: String(e.Product2?.Description || "").slice(0, 300),
+                    unitPrice: Number(e.UnitPrice), score,
+                    usage: { recordCount: raw.length, lastUsageAmount: usageAmount,
+                        lastUsagePeriod: usagePeriodLabel(latest.month, latest.year),
+                        current: currentlyUsed, trend, recent: ordered.slice(-4) }
+                });
+                seen.add(e.Product2Id);
+            }
+        }
+    }
+    candidates.sort((x, y) => y.score - x.score || x.name.localeCompare(y.name));
+    return { accountId, catalogId, catalogName: RECOMMENDATION_CATALOG_NAME, pricebookId,
+        requested: selected, candidates: candidates.slice(0, 70), excluded,
+        usageRecordCount: usageRows.length, eligibleUsageProductCount: usageByProduct.size };
+}
+
+function generateCatalogSuggestions(context) {
+    // Automatic, transparent usage-grounded fallback even if the host cannot invoke Claude.
+    return context.candidates.slice(0, 12).map(c => {
+        const u = c.usage;
+        const growing = u.trend.direction === "GROWING";
+        const inactive = !u.current;
+        const high = u.lastUsageAmount > 500 || growing;
+        const priority = growing && high ? "HIGH" : high ? "MEDIUM" : "LOW";
+        const type = inactive ? "REACTIVATION" : growing ? "EXPANSION" : "CROSS_SELL";
+        const reason = inactive
+            ? `${c.name} was used by this account but not in its latest usage period. Discuss whether reactivation is relevant.`
+            : growing
+                ? `${c.name} usage is growing. Discuss whether additional capacity or inclusion in this quote is appropriate.`
+                : `${c.name} is recorded in this account's Product Usage but is not in the current quote. Consider reviewing it with the customer.`;
+        return { id: `usage-${c.productId}`, product: { id: c.productId, name: c.name },
+            pricebookEntryId: c.pricebookEntryId, type, priority, label: type.replaceAll("_", " "),
+            title: `Consider ${c.name}`, aeInsight: reason,
+            evidence: [`Account usage: ${u.lastUsageAmount} (${u.lastUsagePeriod})`,
+                `Trend: ${u.trend.direction}${u.trend.percentChange == null ? "" : ` (${u.trend.percentChange}%)`}`,
+                `Verified membership: ${context.catalogName}`, "Active entry in selected Price Book"],
+            canAddToRequest: true, requestedByCustomer: false, source: "PRODUCT_USAGE", action: "ADD" };
+    });
+}
+
+function validateClaudeSuggestions(context, submissions) {
+    const candidates = new Map(context.candidates.map(p => [p.productId, p]));
+    const requested = new Set(context.requested.map(p => normalizeInsightText(p.name)));
+    const done = new Set();
+    const result = [];
+    for (const r of submissions.slice(0, 25)) {
+        const c = candidates.get(r.productId);
+        if (!c || done.has(c.productId) || requested.has(normalizeInsightText(c.name))) continue;
+        if (!recommendationKinds.has(r.type)) continue;
+        done.add(c.productId);
+        result.push({ id: `claude-${c.productId}`, product: { id: c.productId, name: c.name }, pricebookEntryId: c.pricebookEntryId, type: r.type, priority: recommendationPriority[r.priority] ? r.priority : "LOW", label: r.type.replaceAll("_", " "), title: `Consider ${c.name}`, aeInsight: String(r.reason || "Review fit with the customer.").slice(0, 650), evidence: (Array.isArray(r.evidence) ? r.evidence : []).slice(0, 4).map(x => String(x).slice(0, 160)), relatedTo: r.relatedTo || null, canAddToRequest: true, requestedByCustomer: false, source: "CLAUDE_DESKTOP", action: r.type === "ALTERNATIVE" ? "COMPARE" : "ADD" });
+    }
+    return result.sort((x, y) => recommendationPriority[y.priority] - recommendationPriority[x.priority]);
+}
+function recommendationToolResponse(textMessage, content) { return { content: [{ type: "text", text: textMessage }], structuredContent: content }; }
+function registerClaudeRecommendationTools(server) {
+    server.registerTool("revenue_get_recommendation_context", { description: "Read verified Salesforce quote candidate products and usage for a Revenue Workspace workflow. Use for requested Claude recommendations. Never invent product IDs.", inputSchema: z.object({ workflowId: z.string().min(1) }), annotations: { readOnlyHint: true } }, async ({ workflowId }) => {
+        try {
+            const state = await readWorkflowState(workflowId);
+            if (!state) throw new Error("Workflow not found.");
+            const pricebookId = state.data?.selection?.quote?.pricebookId || state.data?.salesforce?.pricebook?.id;
+            const context = await buildRecommendationContext(state.data, pricebookId);
+            // Store the exact allowlist for the subsequent Claude submission.
+            await saveWorkflowState({ ...state, data: { ...state.data, recommendationContext: context } });
+            return recommendationToolResponse("Verified catalog candidates for Claude analysis; no Salesforce changes made.", context);
+        } catch (e) { return { isError: true, content: [{ type: "text", text: e.message }] }; }
+    });
+    server.registerTool("revenue_submit_recommendations", { description: "Submit Claude Desktop product recommendations for an existing Revenue Workspace workflow. Only candidates from revenue_get_recommendation_context are accepted. Never changes Salesforce.", inputSchema: z.object({ workflowId: z.string().min(1), recommendations: z.array(z.object({ productId: z.string(), type: z.enum(["ALTERNATIVE", "COMPLEMENTARY", "CROSS_SELL", "EXPANSION", "REACTIVATION"]), priority: z.enum(["HIGH", "MEDIUM", "LOW"]), reason: z.string(), evidence: z.array(z.string()).optional(), relatedTo: z.string().optional() })).max(25) }), annotations: { readOnlyHint: false, destructiveHint: false } }, async ({ workflowId, recommendations }) => {
+        try {
+            const state = await readWorkflowState(workflowId);
+            if (!state?.data?.recommendationContext) throw new Error("Run revenue_get_recommendation_context first.");
+            const liveContext = await buildRecommendationContext(state.data, state.data?.selection?.quote?.pricebookId || state.data?.salesforce?.pricebook?.id);
+            const verified = validateClaudeSuggestions(liveContext, recommendations);
+            const saved = await saveWorkflowState({ ...state, data: { ...state.data, aiRecommendations: verified, aiRecommendationsSource: "CLAUDE_DESKTOP", aiRecommendationsSavedAt: new Date().toISOString() } });
+            return recommendationToolResponse(`${verified.length} Claude recommendations validated and saved. No Salesforce records changed.`, { count: verified.length, workflowId: saved.workflowId });
+        } catch (e) { return { isError: true, content: [{ type: "text", text: e.message }] }; }
+    });
+    console.error("Registered Claude Desktop recommendation tools.");
 }
 
 function appToolMeta() {
@@ -1875,6 +2168,54 @@ function registerWorkspaceActionTools(server) {
 
     registerAppTool(
         server,
+        "workspace_search_products",
+        {
+            title: "Search Salesforce Quote Products",
+            description: "Read-only product catalog search restricted to active entries in the quote Price Book.",
+            inputSchema: z.object({
+                workflowId: z.string().min(1),
+                pricebookId: z.string().min(1),
+                searchTerm: z.string().optional(),
+                limit: z.number().int().min(1).max(50).optional()
+            }),
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+            },
+            _meta: appToolMeta()
+        },
+        async ({ pricebookId, searchTerm, limit }) => {
+            try {
+                const products = await searchWorkspaceProducts({ pricebookId, searchTerm, limit });
+                return {
+                    content: [{ type: "text", text: `${products.length} Salesforce catalog products found.` }],
+                    structuredContent: { products }
+                };
+            } catch (error) {
+                return { isError: true, content: [{ type: "text", text: error?.message || String(error) }] };
+            }
+        }
+    );
+
+    registerAppTool(server, "workspace_get_product_recommendations", {
+        title: "Load Product Recommendations", description: "Read the latest Claude Desktop recommendations and verified catalog fallback for Product Configuration.",
+        inputSchema: z.object({ workflowId: z.string().min(1) }), annotations: { readOnlyHint: true, destructiveHint: false }, _meta: appToolMeta()
+    }, async ({ workflowId }) => {
+        try {
+            const state = await readWorkflowState(workflowId);
+            if (!state) throw new Error("Workflow not found.");
+            const pb = state.data?.selection?.quote?.pricebookId || state.data?.salesforce?.pricebook?.id;
+            const context = await buildRecommendationContext(state.data, pb);
+            const verified = state.data.aiRecommendationsSource === "CLAUDE_DESKTOP" ? validateClaudeSuggestions(context, (state.data.aiRecommendations || []).map(r => ({ productId: r.product.id, type: r.type, priority: r.priority, reason: r.aeInsight, evidence: r.evidence, relatedTo: r.relatedTo }))) : [];
+            const recommendations = verified.length ? verified : generateCatalogSuggestions(context);
+            return recommendationToolResponse(`Loaded ${recommendations.length} recommendations.`, { recommendations, source: verified.length ? "CLAUDE_DESKTOP" : "PRODUCT_USAGE", contextCount: context.candidates.length });
+        } catch (e) { return { isError: true, content: [{ type: "text", text: e.message }] }; }
+    });
+
+    registerAppTool(
+        server,
         "workspace_create_quote",
         {
             title: "Create Salesforce Quote",
@@ -1908,6 +2249,26 @@ function registerWorkspaceActionTools(server) {
                 });
                 if (unresolved.length) {
                     throw new Error(`These products do not have a selected Pricebook Entry: ${unresolved.map(p => p.name).join(", ")}`);
+                }
+
+                // Validate every line before creating a Quote; never trust browser-supplied prices
+                // or Pricebook Entry IDs for an actual Salesforce write.
+                const pricebookEntries = new Map();
+                for (const product of products) {
+                    const selected = product.selectedSellingModel || {};
+                    const id = selected.pricebookEntryId || product.pricebookEntryId || product.selectedSellingModelValue;
+                    if (!/^[a-zA-Z0-9]{15,18}$/.test(String(id || ""))) throw new Error(`Invalid Pricebook Entry for ${product.name}.`);
+                    if (!pricebookEntries.has(id)) {
+                        const found = await soql(
+                            `SELECT Id, Product2Id, Pricebook2Id, UnitPrice, IsActive FROM PricebookEntry ` +
+                            `WHERE Id = '${escapeSoql(id)}' AND Pricebook2Id = '${escapeSoql(quote.pricebookId)}' AND IsActive = true LIMIT 1`
+                        );
+                        if (!found.length) throw new Error(`Pricebook Entry for ${product.name} is not active in the selected Price Book.`);
+                        pricebookEntries.set(id, found[0]);
+                    }
+                    const pbe = pricebookEntries.get(id);
+                    if (product.productId && product.productId !== pbe.Product2Id) throw new Error(`Product and Pricebook Entry mismatch for ${product.name}.`);
+                    validateQuoteLineDiscount(product, Number(pbe.UnitPrice), Number(product.quantity));
                 }
 
                 const quoteDescribe = await describeSObject("Quote");
@@ -1944,14 +2305,24 @@ function registerWorkspaceActionTools(server) {
                 for (const product of products) {
                     const selected = product.selectedSellingModel || {};
                     const pricebookEntryId = selected.pricebookEntryId || product.pricebookEntryId || product.selectedSellingModelValue;
-                    const unitPrice = selected.unitPrice ?? product.unitPrice;
+                    const entry = pricebookEntries.get(pricebookEntryId);
+                    const unitPrice = Number(entry.UnitPrice);
+                    const quantity = Number(product.quantity);
+                    const discount = validateQuoteLineDiscount(product, unitPrice, quantity);
                     const lineBody = {
                         QuoteId: quoteId,
                         PricebookEntryId: pricebookEntryId,
-                        Quantity: Number(product.quantity || 1)
+                        Quantity: quantity,
+                        UnitPrice: unitPrice
                     };
-                    if (unitPrice !== undefined && unitPrice !== null && unitPrice !== "") {
-                        lineBody.UnitPrice = Number(unitPrice);
+                    // Prefer standard Salesforce QuoteLineItem.Discount (percentage).
+                    // If unavailable, write the equivalent net UnitPrice so the actual
+                    // quote total still reflects the AE's discount.
+                    const discountField = qliFields.find(field => field.name === "Discount" && field.createable !== false);
+                    if (discount.percent > 0 && discountField) {
+                        lineBody.Discount = Number(discount.percent.toFixed(8));
+                    } else if (discount.percent > 0) {
+                        lineBody.UnitPrice = Number((unitPrice - discount.amount / quantity).toFixed(8));
                     }
                     setFieldIfAllowed(
                         lineBody,
@@ -1978,7 +2349,9 @@ function registerWorkspaceActionTools(server) {
                     const createdLine = await createSObject("QuoteLineItem", lineBody);
                     const lineId = createdLine?.id || createdLine?.Id;
                     if (!lineId) throw new Error(`Quote line creation failed for ${product.name}: ${JSON.stringify(createdLine)}`);
-                    createdLines.push({ id: lineId, productName: product.name, quantity: Number(product.quantity || 1), pricebookEntryId });
+                    createdLines.push({ id: lineId, productName: product.name, quantity, pricebookEntryId,
+                        listUnitPrice: unitPrice, discountType: discount.type, discountValue: discount.value,
+                        discountAmount: discount.amount, netAmount: discount.subtotal - discount.amount });
                 }
 
                 const quoteRows = await soql(
@@ -2234,6 +2607,7 @@ function createServer() {
 
     registerRevenueWorkspaceApp(server);
     registerWorkspaceActionTools(server);
+    registerClaudeRecommendationTools(server);
 
     server.registerTool(
         "read_account_transcript",

@@ -1820,3 +1820,32 @@ th {
         justify-content: space-between;
     }
 }
+
+
+/* Compact, responsive Salesforce product management */
+.product-workspace { display:grid; gap:18px; }
+.product-summary-strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+.product-summary-strip > div { padding:14px; border:1px solid #dae5ee; border-radius:12px; background:#f5faff; display:grid; gap:5px; }
+.product-summary-strip span {font-size:11px;color:#5c6b7b;font-weight:700}
+.product-summary-strip strong {font-size:19px;color:#032d60}
+.product-toolbar,.product-toolbar-left,.product-search-controls,.product-pages,.product-review-total {display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.product-toolbar-left select {width:auto;min-width:160px;margin:0}
+.product-search-panel {border:1px solid #b5d9f6;border-radius:12px;background:#f6fbff;padding:15px;display:grid;gap:12px}
+.product-search-controls input {flex:1;min-width:180px}
+.product-choice-list {max-height:270px;overflow:auto;display:grid;gap:7px}
+.product-choice-row {background:#fff;border:1px solid #dfebf5;border-radius:9px;padding:10px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.product-choice-row > div {display:grid;gap:4px}.product-choice-row span {font-size:12px;color:#65758a}
+.product-lines-table {min-width:800px}.product-lines-table td {vertical-align:middle}.product-lines-table td:first-child{min-width:190px}.product-lines-table td input {width:90px;margin:0;padding:8px}.product-lines-table td .discount-editor input {width:80px}.discount-editor {display:flex;gap:5px}.discount-editor select {width:65px;padding:8px}
+.product-lines-table td .button {padding:7px 10px}.product-empty {padding:20px;text-align:center;color:#65758a}
+.product-pages {justify-content:center}.product-section-heading {display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.product-section-heading h3 {font-size:16px;color:#032d60;margin:0}.product-section-heading p {font-size:12px;color:#65758a;margin:6px 0 0}
+.product-recommendations {border-top:1px solid #e4e9ef;padding-top:20px;display:grid;gap:12px}
+.recommendation-mini-list {display:grid;gap:8px}.recommendation-mini-row {display:flex;justify-content:space-between;align-items:center;gap:15px;padding:13px;border:1px solid #d9e6f0;border-radius:12px;background:#fff}
+.recommendation-mini-row > div:first-child {min-width:0;flex:1}.recommendation-mini-title {display:flex;align-items:center;gap:10px;flex-wrap:wrap}.recommendation-mini-title strong {color:#032d60}.recommendation-mini-row p {font-size:12px;color:#536678;margin:7px 0}.recommendation-mini-row details {font-size:12px;color:#42566a}.recommendation-mini-row ul {margin:7px 0}.recommendation-mini-row > div:last-child {text-align:right;min-width:110px}
+.product-review-total {justify-content:flex-end;margin:14px 0;color:#43566b}.product-review-total strong {color:#032d60}
+@media(max-width:850px){.product-summary-strip {grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.product-summary-strip{grid-template-columns:1fr 1fr}.product-toolbar,.recommendation-mini-row{align-items:stretch;flex-direction:column}.product-section-heading {flex-wrap:wrap}.product-review-total{justify-content:flex-start}}
+
+/* Claude Desktop recommendations */
+.recommendation-tools {display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.recommendation-tools .button {padding:7px 10px;font-size:12px}
+@media(max-width:760px){.recommendation-tools{justify-content:flex-start}}

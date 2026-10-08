@@ -114,6 +114,9 @@ export default function App() {
     const [errorMessage, setErrorMessage] = useState("");
     const [displayMode, setDisplayMode] = useState("inline");
     const [canFullscreen, setCanFullscreen] = useState(false);
+    const [aiRecommendations, setAiRecommendations] = useState(null);
+    const [aiSource, setAiSource] = useState("");
+    const [recommendationBusy, setRecommendationBusy] = useState(false);
     const hydratedWorkflows = useRef(new Set());
 
     function applyStructuredPayload(structured) {
@@ -199,6 +202,16 @@ export default function App() {
         return clone(selection.products || salesforce.products || requirements.products || []);
     }, [selection.products, salesforce.products, requirements.products]);
 
+    async function loadRecommendations() {
+        setRecommendationBusy(true);
+        try {
+            const result = await app.callServerTool({ name: "workspace_get_product_recommendations", arguments: { workflowId } });
+            if (result?.isError) throw new Error((result.content || []).map(c => c.text).join(" "));
+            setAiRecommendations(result.structuredContent?.recommendations || []);
+            setAiSource(result.structuredContent?.source || "CATALOG");
+        } catch (e) { setErrorMessage(e.message || String(e)); }
+        finally { setRecommendationBusy(false); }
+    }
     async function callWorkspaceTool(name, args) {
         setBusy(true);
         setErrorMessage("");
@@ -364,6 +377,11 @@ export default function App() {
         });
     }
 
+    useEffect(() => {
+        if (view !== "products" || !isConnected || !app || !workflowId || workflowId === "workflow") return;
+        void loadRecommendations();
+    }, [view, workflowId, isConnected, app]);
+
     if (error) {
         return <div className="shell"><Alert tone="error">MCP App error: {error.message}</Alert></div>;
     }
@@ -373,7 +391,7 @@ export default function App() {
     }
 
     return (
-        <main className={`shell${view === "insights" ? " shell-wide" : ""}${displayMode === "fullscreen" ? " shell-fullscreen" : ""}`}>
+        <main className={`shell${["insights", "products", "review"].includes(view) ? " shell-wide" : ""}${displayMode === "fullscreen" ? " shell-fullscreen" : ""}`}>
             <div className="workspace-header">
                 <div>
                     <div className="eyebrow">Salesforce Revenue Cloud</div>
@@ -511,6 +529,19 @@ export default function App() {
             {view === "products" ? (
                 <ProductsView
                     products={products}
+                    recommendations={aiRecommendations || []}
+                    recommendationSource={aiSource}
+                    recommendationBusy={recommendationBusy}
+                    onRefreshRecommendations={loadRecommendations}
+                                        catalog={salesforce.productCatalog || salesforce.availableProducts || []}
+                    searchProducts={async (searchTerm) => {
+                        const result = await app.callServerTool({
+                            name: "workspace_search_products",
+                            arguments: { workflowId, searchTerm, pricebookId: selection.quote?.pricebookId, limit: 30 }
+                        });
+                        if (result?.isError) throw new Error((result.content || []).map(item => item.text || "").join(" ") || "Product search failed");
+                        return result?.structuredContent?.products || result?.structuredContent?.matches || [];
+                    }}
                     onBack={() => persistLocalView("quote_config")}
                     onContinue={(nextProducts) => persistLocalView("review", {
                         selection: { ...selection, products: nextProducts }
@@ -1192,74 +1223,145 @@ function QuoteConfigView({ requirements, salesforce, selection, onBack, onContin
     );
 }
 
-function ProductsView({ products, onBack, onContinue }) {
+function lineUnitPrice(product) {
+    const model = product.selectedSellingModel || (product.sellingModels || [])[0] || {};
+    return Number(model.unitPrice ?? product.unitPrice ?? 0);
+}
+
+function lineDiscount(product) {
+    const qty = Number(product.quantity) || 0;
+    const subtotal = qty * lineUnitPrice(product);
+    const value = Math.max(0, Number(product.discountValue) || 0);
+    return product.discountType === "amount" ? Math.min(subtotal, value) : subtotal * Math.min(100, value) / 100;
+}
+
+function preparedProduct(product) {
+    const models = product.sellingModels || [];
+    const selected = product.selectedSellingModel || models.find(m => (m.value || m.label) === product.selectedSellingModelValue) || models[0] || null;
+    return {
+        ...product,
+        quantity: Number(product.quantity) || 1,
+        selectedSellingModel: selected,
+        selectedSellingModelValue: selected?.value || product.selectedSellingModelValue || "",
+        discountType: product.discountType || "percent",
+        discountValue: Number(product.discountValue) || 0,
+        discountAmount: lineDiscount(product),
+        netAmount: Math.max(0, Number(product.quantity || 1) * lineUnitPrice(product) - lineDiscount(product))
+    };
+}
+
+function ProductsView({ products, recommendations, recommendationSource, recommendationBusy, onRefreshRecommendations, catalog, searchProducts, onBack, onContinue }) {
     const [rows, setRows] = useState(() => clone(products));
-    const hasUnresolved = rows.some((product) => !(product.sellingModels || []).length);
+    const [query, setQuery] = useState("");
+    const [catalogResults, setCatalogResults] = useState(() => clone(catalog));
+    const [searchBusy, setSearchBusy] = useState(false);
+    const [searchError, setSearchError] = useState("");
+    const [addOpen, setAddOpen] = useState(false);
+    const [filter, setFilter] = useState("all");
+    const [page, setPage] = useState(1);
+    const [recommendationPage, setRecommendationPage] = useState(1);
+    const pageSize = 10;
+    const recommendationsPerPage = 5;
+    const normalized = (p) => p.productId || p.id || p.productCode || normalizeUiProductName(p.name || p.productName);
+    const chosen = new Set(rows.map(normalized));
+    const suggested = (recommendations || [])
+        .filter(r => r.product)
+        .map(r => ({ ...r, key: r.id || normalized(r.product), priority: String(r.priority || "LOW").toUpperCase() }))
+        .sort((a, b) => ({ HIGH: 0, MEDIUM: 1, LOW: 2 }[a.priority] ?? 3) - ({ HIGH: 0, MEDIUM: 1, LOW: 2 }[b.priority] ?? 3));
+    const recommendationPages = Math.max(1, Math.ceil(suggested.length / recommendationsPerPage));
+    const currentRecommendationPage = Math.min(recommendationPage, recommendationPages);
+    const visibleRecommendations = suggested.slice(
+        (currentRecommendationPage - 1) * recommendationsPerPage,
+        currentRecommendationPage * recommendationsPerPage
+    );
+    const available = [...catalogResults, ...products].filter((p, i, all) => all.findIndex(item => normalized(item) === normalized(p)) === i);
+    const availableMatches = available.filter(p => !chosen.has(normalized(p)) && `${p.name || p.productName || ""} ${p.productCode || ""}`.toLowerCase().includes(query.toLowerCase()));
+    const displayed = rows.filter(p => filter === "all" || (filter === "discounted" && Number(p.discountValue) > 0)).slice((page - 1) * pageSize, page * pageSize);
+    const filteredCount = rows.filter(p => filter === "all" || Number(p.discountValue) > 0).length;
+    const invalid = rows.some(p => !Number.isFinite(Number(p.quantity)) || Number(p.quantity) < 1 || !Number.isInteger(Number(p.quantity)) || !Number.isFinite(Number(p.discountValue ?? 0)) || Number(p.discountValue ?? 0) < 0 || (p.discountType !== "amount" && Number(p.discountValue ?? 0) > 100) || (p.discountType === "amount" && Number(p.discountValue ?? 0) > Number(p.quantity) * lineUnitPrice(p)) || !(p.selectedSellingModel?.pricebookEntryId || p.pricebookEntryId || (p.sellingModels || []).some(m => m.pricebookEntryId)));
+    const gross = rows.reduce((n, p) => n + (Number(p.quantity) || 0) * lineUnitPrice(p), 0);
+    const discounts = rows.reduce((n, p) => n + lineDiscount(p), 0);
 
     function patch(index, patchValue) {
-        setRows((current) => current.map((item, i) => i === index ? { ...item, ...patchValue } : item));
+        setRows(current => current.map((p, i) => i === index ? { ...p, ...patchValue } : p));
     }
-
+    function addProduct(product) {
+        if (chosen.has(normalized(product))) return;
+        const model = product.selectedSellingModel || (product.sellingModels || [])[0];
+        setRows(current => [...current, {
+            ...product, name: product.name || product.productName, productId: product.productId || product.id,
+            quantity: Number(product.quantity) || 1, selectedSellingModel: model,
+            selectedSellingModelValue: model?.value || product.selectedSellingModelValue || "",
+            discountType: "percent", discountValue: 0
+        }]);
+        setFilter("all");
+        setPage(Math.ceil((rows.length + 1) / pageSize));
+    }
+    async function addRecommendedProduct(recommendation) {
+        try {
+            setSearchBusy(true);
+            const matches = await searchProducts(recommendation.product.name);
+            const match = matches.find(p => p.productId === recommendation.product.id || normalizeUiProductName(p.name) === normalizeUiProductName(recommendation.product.name));
+            if (!match) throw new Error("Recommended product has no active entry in the selected Price Book.");
+            setCatalogResults(current => [...current, match]);
+            addProduct(match);
+        } catch (e) { setSearchError(e.message || String(e)); setAddOpen(true); }
+        finally { setSearchBusy(false); }
+    }
+    async function runSearch() {
+        setSearchBusy(true); setSearchError("");
+        try {
+            const found = await searchProducts(query.trim());
+            if (!Array.isArray(found)) throw new Error("Invalid product-search response");
+            setCatalogResults(found);
+        } catch (e) { setSearchError(e.message || String(e)); }
+        finally { setSearchBusy(false); }
+    }
     return (
-        <Card
-            title="Product Configuration"
-            subtitle="Choose quantities and only the selling models actually returned from Salesforce."
-            footer={
-                <>
-                    <Button onClick={onBack}>Back</Button>
-                    <Button variant="primary" disabled={hasUnresolved} onClick={() => onContinue(rows)}>Review Quote</Button>
-                </>
-            }
-        >
-            <div className="product-list">
-                {rows.map((product, index) => {
-                    const models = product.sellingModels || [];
-                    const selectedValue = product.selectedSellingModel?.value || product.selectedSellingModelValue || models[0]?.value || models[0]?.label || "";
-                    const selectedModel = models.find((m) => (m.value || m.label) === selectedValue) || product.selectedSellingModel || models[0];
-                    return (
-                        <div className="product-card" key={`${product.productId || product.name}-${index}`}>
-                            <div className="product-title-row">
-                                <div>
-                                    <strong>{product.name}</strong>
-                                    {product.productCode ? <span className="muted">{product.productCode}</span> : null}
-                                </div>
-                                <strong>{money(selectedModel?.unitPrice ?? product.unitPrice, product.currency || "USD")}</strong>
-                            </div>
-                            <div className="grid two">
-                                <label>
-                                    <span>Quantity</span>
-                                    <input
-                                        type="number"
-                                        min="1"
-                                        value={product.quantity ?? 1}
-                                        onChange={(e) => patch(index, { quantity: Number(e.target.value) })}
-                                    />
-                                </label>
-                                <label>
-                                    <span>Selling Model</span>
-                                    <select
-                                        value={selectedValue}
-                                        disabled={!models.length}
-                                        onChange={(e) => {
-                                            const next = models.find((m) => (m.value || m.label) === e.target.value);
-                                            patch(index, { selectedSellingModel: next, selectedSellingModelValue: e.target.value });
-                                        }}
-                                    >
-                                        {!models.length ? <option>No model supplied</option> : null}
-                                        {models.map((model) => (
-                                            <option key={model.value || model.label} value={model.value || model.label}>{model.label || model.value}</option>
-                                        ))}
-                                    </select>
-                                </label>
-                            </div>
-                            {models.length === 1 ? <Alert tone="info">Only one selling model is available for this product.</Alert> : null}
+        <Card title="Product Configuration" subtitle="Manage quote products, quantities and AE discounts. Selling models are resolved by Salesforce, not selected here."
+            footer={<><Button onClick={onBack}>Back</Button><Button variant="primary" disabled={invalid || rows.length === 0} onClick={() => onContinue(rows.map(preparedProduct))}>Review Quote</Button></>}>
+            <div className="product-workspace">
+                <div className="product-summary-strip">
+                    <div><span>Selected products</span><strong>{rows.length}</strong></div>
+                    <div><span>List total</span><strong>{money(gross)}</strong></div>
+                    <div><span>Discounts</span><strong>{money(discounts)}</strong></div>
+                    <div><span>Estimated net</span><strong>{money(gross - discounts)}</strong></div>
+                </div>
+                <div className="product-toolbar">
+                    <div className="product-toolbar-left"><strong>Quote line items</strong><select aria-label="Filter products" value={filter} onChange={e => { setFilter(e.target.value); setPage(1); }}><option value="all">All products</option><option value="discounted">Discounted only</option></select></div>
+                    <Button variant="primary" onClick={() => setAddOpen(v => !v)}>{addOpen ? "Close Product Search" : "+ Add Product"}</Button>
+                </div>
+                {addOpen ? <div className="product-search-panel">
+                    <strong>Add from Salesforce product catalog</strong>
+                    <div className="product-search-controls"><input aria-label="Search product catalog" placeholder="Search product name or code" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => { if (e.key === "Enter") runSearch(); }}/><Button disabled={searchBusy} onClick={runSearch}>{searchBusy ? "Searching…" : "Search Salesforce"}</Button></div>
+                    {searchError ? <Alert tone="warning">{searchError}. A server-side workspace_search_products tool is required for live catalog search.</Alert> : null}
+                    <div className="product-choice-list">{availableMatches.slice(0, 30).map(p => <div key={normalized(p)} className="product-choice-row"><div><strong>{p.name || p.productName}</strong><span>{p.productCode || ""} · {money(lineUnitPrice(p))}</span></div><Button onClick={() => addProduct(p)}>Add</Button></div>)}{!availableMatches.length ? <p className="muted">No matching loaded products. Search Salesforce to retrieve more.</p> : null}</div>
+                </div> : null}
+                <div className="table-wrap product-lines-wrap"><table className="product-lines-table"><thead><tr><th>Product</th><th>Qty</th><th className="num">Unit price</th><th>Discount</th><th className="num">Net total</th><th>Action</th></tr></thead><tbody>
+                    {displayed.map(product => {
+                        const index = rows.indexOf(product);
+                        const subtotal = (Number(product.quantity) || 0) * lineUnitPrice(product);
+                        return <tr key={`${normalized(product)}-${index}`}><td><strong>{product.name}</strong><div className="muted">{product.productCode || ""}</div></td><td><input aria-label={`Quantity for ${product.name}`} type="number" min="1" step="1" value={product.quantity ?? 1} onChange={e => patch(index, { quantity: e.target.value })}/></td><td className="num">{money(lineUnitPrice(product), product.currency || "USD")}</td><td><div className="discount-editor"><input aria-label={`Discount for ${product.name}`} type="number" min="0" max={product.discountType === "amount" ? subtotal : 100} step="0.01" value={product.discountValue ?? 0} onChange={e => patch(index, { discountValue: e.target.value })}/><select aria-label={`Discount type for ${product.name}`} value={product.discountType || "percent"} onChange={e => patch(index, { discountType: e.target.value, discountValue: 0 })}><option value="percent">%</option><option value="amount">$</option></select></div></td><td className="num"><strong>{money(Math.max(0, subtotal - lineDiscount(product)), product.currency || "USD")}</strong></td><td><Button onClick={() => { setRows(current => current.filter((_, i) => i !== index)); setPage(1); }}>Remove</Button></td></tr>;
+                    })}
+                </tbody></table>{rows.length === 0 ? <p className="product-empty">No products selected. Add a product to continue.</p> : null}</div>
+                {filteredCount > pageSize ? <div className="product-pages"><Button disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Previous</Button><span>Page {page} of {Math.ceil(filteredCount / pageSize)}</span><Button disabled={page >= Math.ceil(filteredCount / pageSize)} onClick={() => setPage(p => p + 1)}>Next</Button></div> : null}
+                {invalid ? <Alert tone="warning">One or more products have invalid quantities, discounts or unresolved Salesforce pricing. Resolve before continuing.</Alert> : null}
+                <section className="product-recommendations"><div className="product-section-heading"><div><h3>Product Usage Recommendations</h3><p>{recommendationSource === "CLAUDE_DESKTOP" ? "Claude-reviewed account usage suggestions" : "Automatically generated from this account's Product Usage and Agent Productivity Catalog"}. Only eligible, unselected products appear.</p></div><div className="recommendation-tools"><Badge tone="info">{suggested.length} suggestions</Badge><Button disabled={recommendationBusy} onClick={onRefreshRecommendations}>{recommendationBusy ? "Analyzing…" : "Refresh"}</Button></div></div>
+                    {suggested.length ? <div className="recommendation-mini-list">{visibleRecommendations.map(r => {
+                        const selected = chosen.has(normalized(r.product));
+                        const matchingProduct = available.find(p => normalized(p) === normalized(r.product) || normalizeUiProductName(p.name) === normalizeUiProductName(r.product.name));
+                        const resolved = matchingProduct && (matchingProduct.pricebookEntryId || matchingProduct.selectedSellingModel?.pricebookEntryId || (matchingProduct.sellingModels || []).some(m => m.pricebookEntryId));
+                        return <div className="recommendation-mini-row" key={r.key}><div><div className="recommendation-mini-title"><Badge tone={r.priority === "HIGH" ? "warning" : r.priority === "MEDIUM" ? "info" : "neutral"}>{r.priority === "HIGH" ? "Highly Recommended" : r.priority === "MEDIUM" ? "Recommended" : "Optional"}</Badge><strong>{r.product.name}</strong></div><p>{r.aeInsight || r.title || r.label || "Suggested based on account analysis."} {r.type === "ALTERNATIVE" ? "Compare first. Adding does not remove either existing product." : ""}</p>{r.evidence?.length ? <details><summary>Why recommended</summary><ul>{r.evidence.map((e, i) => <li key={i}>{e}</li>)}</ul></details> : null}</div><div>{r.type === "COEXISTENCE" ? <Badge tone="info">Keep both selected</Badge> : selected ? <Badge tone="success">Added</Badge> : <Button disabled={searchBusy} onClick={() => resolved ? addProduct(matchingProduct) : addRecommendedProduct(r)}>{searchBusy ? "Checking…" : "Add to Quote"}</Button>}{r.type !== "COEXISTENCE" && !selected && !resolved ? <div className="muted">Verifies Salesforce pricing on add</div> : null}</div></div>;
+                    })}</div> : <p className="muted">No qualifying products: verify this account has Product Usage for active products in Agent Productivity Catalog and the selected Price Book.</p>}
+                    {suggested.length > recommendationsPerPage ? (
+                        <div className="product-pages" role="navigation" aria-label="Product recommendation pages">
+                            <Button disabled={currentRecommendationPage <= 1} onClick={() => setRecommendationPage(p => Math.max(1, p - 1))}>Previous</Button>
+                            <span>Page {currentRecommendationPage} of {recommendationPages} · Showing {(currentRecommendationPage - 1) * recommendationsPerPage + 1}–{Math.min(currentRecommendationPage * recommendationsPerPage, suggested.length)} of {suggested.length}</span>
+                            <Button disabled={currentRecommendationPage >= recommendationPages} onClick={() => setRecommendationPage(p => Math.min(recommendationPages, p + 1))}>Next</Button>
                         </div>
-                    );
-                })}
+                    ) : null}
+                </section>
             </div>
-            {hasUnresolved ? (
-                <Alert tone="error">One or more products do not have an active Pricebook Entry / selling model in the selected Price Book. Resolve those products before continuing.</Alert>
-            ) : null}
         </Card>
     );
 }
@@ -1267,56 +1369,15 @@ function ProductsView({ products, onBack, onContinue }) {
 function ReviewView({ requirements, salesforce, selection, products, busy, onBack, onCreateQuote }) {
     const quote = selection.quote || {};
     const opportunity = selection.opportunity || salesforce.selectedOpportunity || salesforce.opportunity || {};
-    const hasInvalidProduct = products.some((product) => {
-        const selected = product.selectedSellingModel || {};
-        return !(selected.pricebookEntryId || product.pricebookEntryId || product.selectedSellingModelValue);
-    });
-    return (
-        <Card
-            title="Review Quote"
-            subtitle="This is the final confirmation checkpoint before Salesforce is modified."
-            footer={
-                <>
-                    <Button disabled={busy} onClick={onBack}>Back</Button>
-                    <Button variant="primary" disabled={busy || hasInvalidProduct || !opportunity.id || !quote.pricebookId} onClick={onCreateQuote}>Create Quote</Button>
-                </>
-            }
-        >
-            <div className="grid two">
-                <Field label="Account" value={requirements.accountName || salesforce.account?.name} />
-                <Field label="Opportunity" value={opportunity.name || requirements.opportunityName} />
-                <Field label="Quote" value={quote.name} />
-                <Field label="Start Date" value={niceDate(quote.startDate)} />
-                <Field label="Term" value={quote.termMonths ? `${quote.termMonths} months` : "—"} />
-                <Field label="Billing" value={quote.billingFrequency} />
-                <Field label="Price Book" value={quote.pricebookName || salesforce.pricebook?.name} />
-            </div>
-            <SectionTitle>Products</SectionTitle>
-            <div className="table-wrap">
-                <table>
-                    <thead><tr><th>Product</th><th>Model</th><th className="num">Qty</th><th className="num">Unit Price</th></tr></thead>
-                    <tbody>
-                        {products.map((product, index) => {
-                            const selectedModel = product.selectedSellingModel || (product.sellingModels || [])[0] || {};
-                            return (
-                                <tr key={`${product.productId || product.name}-${index}`}>
-                                    <td>{product.name}</td>
-                                    <td>{selectedModel.label || selectedModel.value || "—"}</td>
-                                    <td className="num">{product.quantity ?? 1}</td>
-                                    <td className="num">{money(selectedModel.unitPrice ?? product.unitPrice, product.currency || "USD")}</td>
-                                </tr>
-                            );
-                        })}
-                    </tbody>
-                </table>
-            </div>
-            {hasInvalidProduct ? (
-                <Alert tone="error">The Quote cannot be created until every product has a valid Pricebook Entry / selling model.</Alert>
-            ) : (
-                <Alert>This button is the explicit user confirmation to create the Quote and its configured lines.</Alert>
-            )}
-        </Card>
-    );
+    const hasInvalidProduct = !products.length || products.some(p => !(p.selectedSellingModel?.pricebookEntryId || p.pricebookEntryId) || Number(p.quantity) < 1);
+    const gross = products.reduce((sum, p) => sum + Number(p.quantity || 0) * lineUnitPrice(p), 0);
+    const discounts = products.reduce((sum, p) => sum + lineDiscount(p), 0);
+    return <Card title="Review Quote" subtitle="Confirm selected products and AE discounts before creating Salesforce quote line items." footer={<><Button disabled={busy} onClick={onBack}>Back</Button><Button variant="primary" disabled={busy || hasInvalidProduct || !opportunity.id || !quote.pricebookId} onClick={onCreateQuote}>Create Quote</Button></>}>
+        <div className="grid two"><Field label="Account" value={requirements.accountName || salesforce.account?.name}/><Field label="Opportunity" value={opportunity.name || requirements.opportunityName}/><Field label="Quote" value={quote.name}/><Field label="Start Date" value={niceDate(quote.startDate)}/><Field label="Term" value={quote.termMonths ? `${quote.termMonths} months` : "—"}/><Field label="Billing" value={quote.billingFrequency}/><Field label="Price Book" value={quote.pricebookName || salesforce.pricebook?.name}/></div>
+        <SectionTitle>Quote Line Items</SectionTitle><div className="table-wrap"><table><thead><tr><th>Product</th><th className="num">Qty</th><th className="num">Unit price</th><th className="num">Discount</th><th className="num">Net</th></tr></thead><tbody>{products.map((p, index) => <tr key={`${p.productId || p.name}-${index}`}><td>{p.name}</td><td className="num">{p.quantity}</td><td className="num">{money(lineUnitPrice(p))}</td><td className="num">{p.discountType === "amount" ? money(p.discountValue || 0) : `${p.discountValue || 0}%`}</td><td className="num">{money(Number(p.quantity || 0) * lineUnitPrice(p) - lineDiscount(p))}</td></tr>)}</tbody></table></div>
+        <div className="product-review-total"><span>List total: {money(gross)}</span><span>Discounts: {money(discounts)}</span><strong>Estimated net: {money(gross - discounts)}</strong></div>
+        {hasInvalidProduct ? <Alert tone="error">Products must have valid Salesforce Pricebook Entries before quote creation.</Alert> : <Alert tone="info">Creating the quote requires the server to write the specified discounts to the actual Salesforce quote line items. Review the discount mapping in server.js before using this in production.</Alert>}
+    </Card>;
 }
 
 function QuoteSummaryView({ summary, onOpen, onContinue }) {

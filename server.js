@@ -20,6 +20,7 @@ const REVENUE_WORKSPACE_URI = "ui://salesforce-revenue/workspace.html";
 
 const workspaceViews = [
     "requirements",
+    "insights",
     "opportunity",
     "opportunity_summary",
     "quote_config",
@@ -759,6 +760,409 @@ async function resolveAccountByName(accountName) {
     return rows;
 }
 
+async function discoverProductUsageData(accountName) {
+    if (!accountName) {
+        throw new Error("Account name is required for Product Usage discovery.");
+    }
+
+    const accounts = await resolveAccountByName(accountName);
+    if (!accounts.length) {
+        throw new Error(`No Salesforce Account named '${accountName}' was found.`);
+    }
+
+    const account = accounts[0];
+    const rows = await soql(
+        `SELECT Id, Name, Account__c, Account__r.Name, Product__c, Product__r.Name, ` +
+        `Product_Family__c, Usage_Amount__c, Month__c, Year__c ` +
+        `FROM Product_Usage__c ` +
+        `WHERE Account__c = '${escapeSoql(account.Id)}' ` +
+        `ORDER BY Year__c ASC, Month__c ASC, Product__r.Name ASC`
+    );
+
+    return {
+        account: { id: account.Id, name: account.Name },
+        matchingAccounts: accounts.map(row => ({ id: row.Id, name: row.Name })),
+        recordCount: rows.length,
+        productUsages: rows.map(row => ({
+            id: row.Id,
+            name: row.Name,
+            product: {
+                id: row.Product__c || null,
+                name: row.Product__r?.Name || null
+            },
+            productFamily: row.Product_Family__c || null,
+            usageAmount: row.Usage_Amount__c == null ? null : Number(row.Usage_Amount__c),
+            month: row.Month__c == null ? null : Number(row.Month__c),
+            year: row.Year__c == null ? null : Number(row.Year__c)
+        }))
+    };
+}
+
+function normalizeInsightText(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function usagePeriodIndex(year, month) {
+    const y = Number(year);
+    const m = Number(month);
+    if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) return null;
+    return y * 12 + (m - 1);
+}
+
+function usagePeriodLabel(month, year) {
+    const y = Number(year);
+    const m = Number(month);
+    if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) return "Unknown period";
+    const label = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric", timeZone: "UTC" })
+        .format(new Date(Date.UTC(y, m - 1, 1)));
+    return label;
+}
+
+function productNameMatches(left, right) {
+    const a = normalizeInsightText(left);
+    const b = normalizeInsightText(right);
+    if (!a || !b) return false;
+    if (a === b) return true;
+
+    // Conservative fallback for harmless punctuation/bracket differences while
+    // avoiding fuzzy product substitutions that could change quote contents.
+    return a.length >= 8 && b.length >= 8 && (a.includes(b) || b.includes(a));
+}
+
+function productIsExplicitlyExcluded(productName, productFamily, excludedProducts = []) {
+    const haystack = normalizeInsightText(`${productName || ""} ${productFamily || ""}`);
+    if (!haystack) return false;
+
+    const synonymGroups = [
+        ["messaging", "sms", "mms", "whatsapp"],
+        ["email", "sendgrid"],
+        ["voice", "cps"],
+        ["support", "service support"]
+    ];
+
+    return (excludedProducts || []).some(item => {
+        const excluded = normalizeInsightText(item);
+        if (!excluded) return false;
+        if (haystack.includes(excluded)) return true;
+
+        return synonymGroups.some(group => {
+            const excludedHitsGroup = group.some(token => excluded.includes(token));
+            const productHitsGroup = group.some(token => haystack.includes(token));
+            return excludedHitsGroup && productHitsGroup;
+        });
+    });
+}
+
+function calculateUsageTrend(records) {
+    const usable = (records || [])
+        .filter(row => Number.isFinite(Number(row.usageAmount)) && usagePeriodIndex(row.year, row.month) !== null)
+        .sort((a, b) => usagePeriodIndex(a.year, a.month) - usagePeriodIndex(b.year, b.month));
+
+    if (usable.length < 2) {
+        return { direction: "INSUFFICIENT_DATA", percentChange: null, sampleSize: usable.length };
+    }
+
+    const window = usable.slice(-3);
+    const first = Number(window[0].usageAmount);
+    const last = Number(window[window.length - 1].usageAmount);
+    const percentChange = first === 0 ? null : ((last - first) / Math.abs(first)) * 100;
+
+    let direction = "STABLE";
+    if (percentChange !== null && percentChange >= 20) direction = "GROWING";
+    if (percentChange !== null && percentChange <= -20) direction = "DECLINING";
+
+    return {
+        direction,
+        percentChange: percentChange === null ? null : Number(percentChange.toFixed(1)),
+        sampleSize: window.length,
+        firstUsageAmount: first,
+        latestUsageAmount: last
+    };
+}
+
+function buildRecommendationId(type, productName) {
+    return `${String(type || "insight").toLowerCase()}-${normalizeInsightText(productName).replace(/\s+/g, "-")}`;
+}
+
+async function analyzeAccountInsights(requirements) {
+    const accountName = requirements?.accountName;
+    if (!accountName) {
+        throw new Error("Account name is required for Account Insights analysis.");
+    }
+
+    const raw = await discoverProductUsageData(accountName);
+    const usageRows = raw.productUsages || [];
+    const requestedProducts = Array.isArray(requirements?.products) ? requirements.products : [];
+    const excludedProducts = Array.isArray(requirements?.excluded) ? requirements.excluded : [];
+
+    const validPeriods = usageRows
+        .map(row => ({ row, index: usagePeriodIndex(row.year, row.month) }))
+        .filter(item => item.index !== null);
+    const latestPeriodIndex = validPeriods.length
+        ? Math.max(...validPeriods.map(item => item.index))
+        : null;
+    const latestPeriodRow = latestPeriodIndex === null
+        ? null
+        : validPeriods.find(item => item.index === latestPeriodIndex)?.row || null;
+
+    const grouped = new Map();
+    for (const row of usageRows) {
+        const key = row.product?.id || normalizeInsightText(row.product?.name) || row.id;
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push(row);
+    }
+
+    const history = [];
+    for (const rows of grouped.values()) {
+        const sorted = [...rows].sort((a, b) => {
+            const ai = usagePeriodIndex(a.year, a.month) ?? -1;
+            const bi = usagePeriodIndex(b.year, b.month) ?? -1;
+            return ai - bi;
+        });
+        const last = sorted[sorted.length - 1];
+        const first = sorted[0];
+        const productName = last?.product?.name || first?.product?.name || "Unknown Product";
+        const productFamily = last?.productFamily || first?.productFamily || null;
+        const requested = requestedProducts.find(item => productNameMatches(item?.name, productName)) || null;
+        const excluded = productIsExplicitlyExcluded(productName, productFamily, excludedProducts);
+        const lastPeriodIndex = usagePeriodIndex(last?.year, last?.month);
+        const current = latestPeriodIndex !== null && lastPeriodIndex === latestPeriodIndex;
+        const trend = calculateUsageTrend(sorted);
+
+        history.push({
+            productId: last?.product?.id || first?.product?.id || null,
+            productName,
+            productFamily,
+            status: current ? "CURRENT" : "PREVIOUSLY_USED",
+            statusLabel: current ? "Currently used" : "Previously used",
+            requested: Boolean(requested),
+            requestedQuantity: requested?.quantity ?? null,
+            explicitlyExcluded: excluded,
+            recordCount: sorted.length,
+            firstUsageAmount: first?.usageAmount ?? null,
+            firstUsagePeriod: first ? usagePeriodLabel(first.month, first.year) : null,
+            lastUsageAmount: last?.usageAmount ?? null,
+            lastUsagePeriod: last ? usagePeriodLabel(last.month, last.year) : null,
+            lastUsageMonth: last?.month ?? null,
+            lastUsageYear: last?.year ?? null,
+            trend,
+            recentUsage: sorted.slice(-4).map(row => ({
+                usageAmount: row.usageAmount,
+                month: row.month,
+                year: row.year,
+                periodLabel: usagePeriodLabel(row.month, row.year)
+            }))
+        });
+    }
+
+    // Requested products without any Product Usage history are intentionally
+    // represented as NEVER_USED. This is still a useful customer conversation
+    // signal, but it is not treated as evidence that the customer needs it.
+    for (const requested of requestedProducts) {
+        const existing = history.find(item => productNameMatches(item.productName, requested?.name));
+        if (existing) continue;
+        history.push({
+            productId: null,
+            productName: requested?.name || "Unknown Product",
+            productFamily: null,
+            status: "NEVER_USED",
+            statusLabel: "No previous usage found",
+            requested: true,
+            requestedQuantity: requested?.quantity ?? 1,
+            explicitlyExcluded: productIsExplicitlyExcluded(requested?.name, null, excludedProducts),
+            recordCount: 0,
+            firstUsageAmount: null,
+            firstUsagePeriod: null,
+            lastUsageAmount: null,
+            lastUsagePeriod: null,
+            lastUsageMonth: null,
+            lastUsageYear: null,
+            trend: { direction: "INSUFFICIENT_DATA", percentChange: null, sampleSize: 0 },
+            recentUsage: []
+        });
+    }
+
+    const recommendations = [];
+    const addRecommendation = recommendation => {
+        if (recommendation?.product?.name && !recommendations.some(item => item.id === recommendation.id)) {
+            recommendations.push(recommendation);
+        }
+    };
+
+    for (const item of history) {
+        if (item.explicitlyExcluded) continue;
+
+        if (item.requested && item.status === "PREVIOUSLY_USED") {
+            addRecommendation({
+                id: buildRecommendationId("REQUESTED_REACTIVATION", item.productName),
+                type: "REQUESTED_REACTIVATION",
+                priority: "HIGH",
+                label: "Previous service being revisited",
+                title: `Revisit previous ${item.productName} usage`,
+                product: { id: item.productId, name: item.productName },
+                requestedByCustomer: true,
+                canAddToRequest: false,
+                aeInsight: `${item.productName} was used previously by this account and is part of the customer's current request.`,
+                customerTalkingPoint: `You've used ${item.productName} previously. Would you like us to review whether the prior setup still fits your current requirements?`,
+                evidence: [
+                    item.lastUsagePeriod ? `Last recorded usage: ${item.lastUsagePeriod}` : null,
+                    item.lastUsageAmount !== null ? `Last usage amount: ${item.lastUsageAmount}` : null,
+                    latestPeriodRow ? `Not present in the latest account usage period (${usagePeriodLabel(latestPeriodRow.month, latestPeriodRow.year)})` : null,
+                    "Included in the current customer request"
+                ].filter(Boolean)
+            });
+            continue;
+        }
+
+        if (item.requested && item.status === "CURRENT") {
+            const growing = item.trend?.direction === "GROWING";
+            addRecommendation({
+                id: buildRecommendationId("EXISTING_EXPANSION", item.productName),
+                type: "EXISTING_EXPANSION",
+                priority: growing ? "HIGH" : "MEDIUM",
+                label: "Existing service expansion",
+                title: `Review ${item.productName} expansion`,
+                product: { id: item.productId, name: item.productName },
+                requestedByCustomer: true,
+                canAddToRequest: false,
+                aeInsight: growing
+                    ? `${item.productName} is already in use and recent usage is increasing.`
+                    : `${item.productName} is already in use and is part of the current expansion request.`,
+                customerTalkingPoint: growing
+                    ? `Your ${item.productName} usage has been increasing. Should we size this expansion with additional growth in mind?`
+                    : `You're already using ${item.productName}. Would you like us to review the current usage level before we size the expansion?`,
+                evidence: [
+                    latestPeriodRow ? `Present in latest usage period: ${usagePeriodLabel(latestPeriodRow.month, latestPeriodRow.year)}` : null,
+                    item.lastUsageAmount !== null ? `Latest usage amount: ${item.lastUsageAmount}` : null,
+                    item.trend?.percentChange !== null && item.trend?.percentChange !== undefined
+                        ? `Recent usage change: ${item.trend.percentChange > 0 ? "+" : ""}${item.trend.percentChange}%`
+                        : null,
+                    "Included in the current customer request"
+                ].filter(Boolean)
+            });
+            continue;
+        }
+
+        if (item.requested && item.status === "NEVER_USED") {
+            addRecommendation({
+                id: buildRecommendationId("NEW_SERVICE", item.productName),
+                type: "NEW_SERVICE",
+                priority: "MEDIUM",
+                label: "New service",
+                title: `New service: ${item.productName}`,
+                product: { id: item.productId, name: item.productName },
+                requestedByCustomer: true,
+                canAddToRequest: false,
+                aeInsight: `No Product Usage history was found for ${item.productName}, but the customer requested it in the current conversation.`,
+                customerTalkingPoint: `${item.productName} would be new for this account. Would it help to review the available options and expected usage before we finalize the quote?`,
+                evidence: [
+                    "No Product Usage records found for this account",
+                    "Included in the current customer request"
+                ]
+            });
+            continue;
+        }
+
+        if (!item.requested && item.status === "CURRENT" && item.trend?.direction === "DECLINING") {
+            addRecommendation({
+                id: buildRecommendationId("USAGE_CHANGE", item.productName),
+                type: "USAGE_CHANGE",
+                priority: "MEDIUM",
+                label: "Usage trend worth discussing",
+                title: `Discuss recent ${item.productName} usage change`,
+                product: { id: item.productId, name: item.productName },
+                requestedByCustomer: false,
+                canAddToRequest: false,
+                aeInsight: `${item.productName} is currently used, but recent usage has declined materially.`,
+                customerTalkingPoint: `We've seen ${item.productName} usage change recently. Has your usage pattern changed, or should we plan for a different level going forward?`,
+                evidence: [
+                    item.lastUsageAmount !== null ? `Latest usage amount: ${item.lastUsageAmount}` : null,
+                    item.trend?.percentChange !== null ? `Recent usage change: ${item.trend.percentChange}%` : null
+                ].filter(Boolean)
+            });
+        }
+    }
+
+    // At most one optional historical-service prompt is added so Account Insights
+    // remains focused and does not become a generic upsell list.
+    if (latestPeriodIndex !== null) {
+        const optionalHistorical = history
+            .filter(item => !item.requested && !item.explicitlyExcluded && item.status === "PREVIOUSLY_USED")
+            .map(item => ({ ...item, periodIndex: usagePeriodIndex(item.lastUsageYear, item.lastUsageMonth) }))
+            .filter(item => item.periodIndex !== null && latestPeriodIndex - item.periodIndex <= 2)
+            .sort((a, b) => (b.lastUsageAmount || 0) - (a.lastUsageAmount || 0))[0];
+
+        if (optionalHistorical) {
+            addRecommendation({
+                id: buildRecommendationId("PREVIOUS_SERVICE_REVIEW", optionalHistorical.productName),
+                type: "PREVIOUS_SERVICE_REVIEW",
+                priority: "LOW",
+                label: "Related previous service",
+                title: `Consider revisiting ${optionalHistorical.productName}`,
+                product: { id: optionalHistorical.productId, name: optionalHistorical.productName },
+                requestedByCustomer: false,
+                canAddToRequest: true,
+                aeInsight: `${optionalHistorical.productName} was used recently by this account but is not in the current request.`,
+                customerTalkingPoint: `You used ${optionalHistorical.productName} recently. Is that intentionally out of scope for this phase, or would you like us to revisit it while we review the expansion?`,
+                evidence: [
+                    optionalHistorical.lastUsagePeriod ? `Last recorded usage: ${optionalHistorical.lastUsagePeriod}` : null,
+                    optionalHistorical.lastUsageAmount !== null ? `Last usage amount: ${optionalHistorical.lastUsageAmount}` : null,
+                    "Not included in the current customer request"
+                ].filter(Boolean)
+            });
+        }
+    }
+
+    const priorityScore = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+    recommendations.sort((a, b) => {
+        const byPriority = (priorityScore[b.priority] || 0) - (priorityScore[a.priority] || 0);
+        if (byPriority) return byPriority;
+        return Number(b.requestedByCustomer) - Number(a.requestedByCustomer);
+    });
+
+    history.sort((a, b) => {
+        if (a.requested !== b.requested) return Number(b.requested) - Number(a.requested);
+        const statusScore = { CURRENT: 3, PREVIOUSLY_USED: 2, NEVER_USED: 1 };
+        const byStatus = (statusScore[b.status] || 0) - (statusScore[a.status] || 0);
+        if (byStatus) return byStatus;
+        const ai = usagePeriodIndex(a.lastUsageYear, a.lastUsageMonth) ?? -1;
+        const bi = usagePeriodIndex(b.lastUsageYear, b.lastUsageMonth) ?? -1;
+        if (ai !== bi) return bi - ai;
+        return a.productName.localeCompare(b.productName);
+    });
+
+    return {
+        analysisComplete: true,
+        account: raw.account,
+        matchingAccounts: raw.matchingAccounts,
+        usageRecordCount: raw.recordCount,
+        latestUsagePeriod: latestPeriodRow
+            ? {
+                month: latestPeriodRow.month,
+                year: latestPeriodRow.year,
+                label: usagePeriodLabel(latestPeriodRow.month, latestPeriodRow.year)
+            }
+            : null,
+        summary: {
+            requestedProducts: requestedProducts.length,
+            currentProducts: history.filter(item => item.status === "CURRENT").length,
+            previousProducts: history.filter(item => item.status === "PREVIOUSLY_USED").length,
+            newRequestedProducts: history.filter(item => item.status === "NEVER_USED" && item.requested).length,
+            recommendations: Math.min(recommendations.length, 5),
+            suppressedByExplicitExclusion: history.filter(item => item.explicitlyExcluded).length
+        },
+        productHistory: history,
+        recommendations: recommendations.slice(0, 5),
+        analysisNote: raw.recordCount
+            ? "Recommendations are grounded in Product Usage history plus the current customer request. No Salesforce records were modified."
+            : "No Product Usage records were found for this account. Requested products are shown as new-service context only."
+    };
+}
+
 async function readLatestAccountTextFile({ accountName, fileName }) {
     const accounts = await resolveAccountByName(accountName);
     if (!accounts.length) {
@@ -1191,6 +1595,70 @@ function registerWorkspaceActionTools(server) {
     );
     registerAppTool(
         server,
+        "workspace_analyze_account_insights",
+        {
+            title: "Analyze Account Insights",
+            description:
+                "Read-only analysis of Salesforce Product Usage for the Revenue Workspace. " +
+                "Combines current customer requirements with account usage history to produce customer-safe conversation recommendations. " +
+                "This tool does not create or modify Salesforce records.",
+            inputSchema: z.object({
+                workflowId: z.string().min(1),
+                requirements: z.record(z.string(), z.unknown()),
+                carryForward: z.record(z.string(), z.unknown()).optional()
+            }),
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+            },
+            _meta: appToolMeta()
+        },
+        async ({ workflowId, requirements, carryForward }) => {
+            try {
+                const insights = await analyzeAccountInsights(requirements);
+                return {
+                    content: [{ type: "text", text: `Account Insights prepared for ${insights.account.name}.` }],
+                    structuredContent: await saveWorkflowState({
+                        version: 5,
+                        view: "insights",
+                        workflowId,
+                        data: {
+                            ...(carryForward || {}),
+                            requirements,
+                            salesforce: {
+                                ...((carryForward || {}).salesforce || {}),
+                                account: insights.account,
+                                accountInsights: insights
+                            }
+                        }
+                    })
+                };
+            } catch (error) {
+                return {
+                    isError: true,
+                    content: [{ type: "text", text: error?.message || String(error) }],
+                    structuredContent: await saveWorkflowState({
+                        version: 5,
+                        view: "error",
+                        workflowId,
+                        data: {
+                            ...(carryForward || {}),
+                            requirements,
+                            operationSummary: {
+                                success: false,
+                                message: error?.message || String(error)
+                            }
+                        }
+                    })
+                };
+            }
+        }
+    );
+
+    registerAppTool(
+        server,
         "workspace_discover_opportunities",
         {
             title: "Discover Salesforce Opportunities",
@@ -1592,7 +2060,7 @@ function registerWorkspaceActionTools(server) {
         }
     );
 
-    console.error("Registered app-only Revenue Workspace action + persistence tools.");
+    console.error("Registered app-only Revenue Workspace actions, Account Insights, and persistence tools.");
 }
 
 function registerRevenueWorkspaceApp(server) {
@@ -1656,6 +2124,7 @@ function registerRevenueWorkspaceApp(server) {
                 data: {
                     requirements,
                     nextActions: [
+                        "Analyze Salesforce Product Usage and prepare customer-safe Account Insights",
                         "Find the Account and matching Opportunities in Salesforce",
                         "Choose an existing Opportunity or create a new Opportunity",
                         "Prepare the Revenue Cloud Quote and commercial terms",
@@ -1817,6 +2286,44 @@ function createServer() {
     );
 
     console.error("Registered Salesforce Account transcript reader: read_account_transcript");
+
+    server.registerTool(
+        "read_account_product_usage",
+        {
+            description:
+                "Read Product Usage history for a Salesforce Account. Returns Product, Product Family, Usage Amount, Month, and Year. This tool is read-only and does not modify Salesforce.",
+            inputSchema: z.object({
+                accountName: z.string().min(1)
+            }),
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+            }
+        },
+        async ({ accountName }) => {
+            try {
+                const result = await discoverProductUsageData(accountName);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Product Usage discovery completed for ${result.account.name}. ${result.recordCount} records found.`
+                        }
+                    ],
+                    structuredContent: result
+                };
+            } catch (error) {
+                return {
+                    isError: true,
+                    content: [{ type: "text", text: error?.message || String(error) }]
+                };
+            }
+        }
+    );
+
+    console.error("Registered Salesforce Product Usage reader: read_account_product_usage");
 
     server.registerTool(
         "test_connection",

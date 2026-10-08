@@ -47,6 +47,14 @@ function niceDate(value) {
     }).format(parsed);
 }
 
+function normalizeUiProductName(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
 function mergeWorkspaceData(current, incoming) {
     const left = current && typeof current === "object" ? current : {};
     const right = incoming && typeof incoming === "object" ? incoming : {};
@@ -71,17 +79,18 @@ function mergeWorkspaceData(current, incoming) {
 }
 
 function Progress({ view }) {
-    const steps = ["Requirements", "Opportunity", "Quote", "Products", "Review", "Complete"];
+    const steps = ["Requirements", "Account Insights", "Opportunity", "Quote", "Products", "Review", "Complete"];
     const indexByView = {
         requirements: 0,
-        opportunity: 1,
-        opportunity_summary: 1,
-        quote_config: 2,
-        products: 3,
-        review: 4,
-        quote_summary: 5,
-        final_summary: 5,
-        error: 5
+        insights: 1,
+        opportunity: 2,
+        opportunity_summary: 2,
+        quote_config: 3,
+        products: 4,
+        review: 5,
+        quote_summary: 6,
+        final_summary: 6,
+        error: 6
     };
     const current = indexByView[view] ?? 0;
 
@@ -247,6 +256,85 @@ export default function App() {
         });
     }
 
+    async function addInsightRecommendation(recommendation) {
+        const currentRequirements = clone(workingData.requirements || requirements);
+        const currentSelection = clone(workingData.selection || selection);
+        const currentProducts = Array.isArray(currentRequirements.products) ? currentRequirements.products : [];
+        const wanted = normalizeUiProductName(recommendation?.product?.name);
+        const alreadyPresent = currentProducts.some(product => normalizeUiProductName(product?.name) === wanted);
+        const nextProducts = alreadyPresent
+            ? currentProducts
+            : [
+                ...currentProducts,
+                {
+                    name: recommendation.product.name,
+                    quantity: 1,
+                    notes: `Added by AE from Account Insights: ${recommendation.label || recommendation.type}`
+                }
+            ];
+        const decisions = currentSelection.insightDecisions || {};
+        const accepted = [...new Set([...(decisions.accepted || []), recommendation.id])];
+        const dismissed = (decisions.dismissed || []).filter(id => id !== recommendation.id);
+
+        await persistLocalView("insights", {
+            requirements: { ...currentRequirements, products: nextProducts },
+            selection: {
+                ...currentSelection,
+                insightDecisions: { ...decisions, accepted, dismissed }
+            }
+        });
+    }
+
+    async function removeInsightRecommendation(recommendation) {
+        const currentRequirements = clone(workingData.requirements || requirements);
+        const currentSelection = clone(workingData.selection || selection);
+        const wanted = normalizeUiProductName(recommendation?.product?.name);
+        const decisions = currentSelection.insightDecisions || {};
+        const accepted = (decisions.accepted || []).filter(id => id !== recommendation.id);
+
+        // Only optional recommendations can be added from Account Insights, so
+        // removing one here cannot remove a transcript-requested product.
+        const nextProducts = (currentRequirements.products || []).filter(
+            product => normalizeUiProductName(product?.name) !== wanted
+        );
+
+        await persistLocalView("insights", {
+            requirements: { ...currentRequirements, products: nextProducts },
+            selection: {
+                ...currentSelection,
+                insightDecisions: { ...decisions, accepted }
+            }
+        });
+    }
+
+    async function dismissInsightRecommendation(recommendation) {
+        const currentSelection = clone(workingData.selection || selection);
+        const decisions = currentSelection.insightDecisions || {};
+        const dismissed = [...new Set([...(decisions.dismissed || []), recommendation.id])];
+        const accepted = (decisions.accepted || []).filter(id => id !== recommendation.id);
+
+        await persistLocalView("insights", {
+            selection: {
+                ...currentSelection,
+                insightDecisions: { ...decisions, accepted, dismissed }
+            }
+        });
+    }
+
+    async function restoreInsightRecommendation(recommendation) {
+        const currentSelection = clone(workingData.selection || selection);
+        const decisions = currentSelection.insightDecisions || {};
+        await persistLocalView("insights", {
+            selection: {
+                ...currentSelection,
+                insightDecisions: {
+                    ...decisions,
+                    dismissed: (decisions.dismissed || []).filter(id => id !== recommendation.id)
+                }
+            }
+        });
+    }
+
     if (error) {
         return <div className="shell"><Alert tone="error">MCP App error: {error.message}</Alert></div>;
     }
@@ -275,6 +363,33 @@ export default function App() {
                     nextActions={nextActions}
                     busy={busy}
                     onContinue={async () => {
+                        if (salesforce.accountInsights?.analysisComplete) {
+                            await persistLocalView("insights");
+                            return;
+                        }
+
+                        await callWorkspaceTool("workspace_analyze_account_insights", {
+                            workflowId,
+                            requirements: workingData.requirements || requirements,
+                            carryForward: workingData
+                        });
+                    }}
+                />
+            ) : null}
+
+            {view === "insights" ? (
+                <AccountInsightsView
+                    requirements={requirements}
+                    insights={salesforce.accountInsights || {}}
+                    selection={selection}
+                    busy={busy}
+                    onBack={() => persistLocalView("requirements")}
+                    onAddRecommendation={addInsightRecommendation}
+                    onRemoveRecommendation={removeInsightRecommendation}
+                    onDismissRecommendation={dismissInsightRecommendation}
+                    onRestoreRecommendation={restoreInsightRecommendation}
+                    onContinue={async () => {
+                        const latestRequirements = workingData.requirements || requirements;
                         if (salesforce.discoveryComplete) {
                             await persistLocalView("opportunity");
                             return;
@@ -282,7 +397,7 @@ export default function App() {
 
                         await callWorkspaceTool("workspace_discover_opportunities", {
                             workflowId,
-                            requirements,
+                            requirements: latestRequirements,
                             carryForward: workingData
                         });
                     }}
@@ -295,6 +410,7 @@ export default function App() {
                     salesforce={salesforce}
                     selection={selection}
                     busy={busy}
+                    onBack={() => persistLocalView("insights")}
                     onUseExisting={chooseExistingOpportunity}
                     onSearch={async ({ searchTerm, page, pageSize }) => {
                         await callWorkspaceTool("workspace_discover_opportunities", {
@@ -432,7 +548,7 @@ function RequirementsView({ requirements, nextActions, busy, onContinue }) {
         <Card
             title="Customer Requirements & Next Salesforce Actions"
             subtitle="Extracted from the customer conversation. No Salesforce changes have been made yet."
-            footer={<Button variant="primary" disabled={busy} onClick={onContinue}>{busy ? "Checking Salesforce…" : "Continue"}</Button>}
+            footer={<Button variant="primary" disabled={busy} onClick={onContinue}>{busy ? "Analyzing Account…" : "Analyze Account"}</Button>}
         >
             <div className="grid two">
                 <Field label="Account" value={requirements.accountName} />
@@ -469,6 +585,7 @@ function RequirementsView({ requirements, nextActions, busy, onContinue }) {
             <SectionTitle>Suggested Salesforce Actions</SectionTitle>
             <ol className="next-actions">
                 {(nextActions?.length ? nextActions : [
+                    "Analyze Salesforce Product Usage and prepare customer-safe Account Insights",
                     "Find the Account and matching Opportunities in Salesforce",
                     "Choose an existing Opportunity or create a new Opportunity",
                     "Prepare the Quote and commercial terms",
@@ -484,7 +601,231 @@ function RequirementsView({ requirements, nextActions, busy, onContinue }) {
     );
 }
 
-function OpportunityView({ requirements, salesforce, selection, busy, onUseExisting, onSearch, onCreate }) {
+function AccountInsightsView({
+    requirements,
+    insights,
+    selection,
+    busy,
+    onBack,
+    onAddRecommendation,
+    onRemoveRecommendation,
+    onDismissRecommendation,
+    onRestoreRecommendation,
+    onContinue
+}) {
+    const [showAllHistory, setShowAllHistory] = useState(false);
+    const requestedProducts = requirements.products || [];
+    const history = insights.productHistory || [];
+    const recommendations = insights.recommendations || [];
+    const decisions = selection.insightDecisions || {};
+    const accepted = new Set(decisions.accepted || []);
+    const dismissed = new Set(decisions.dismissed || []);
+    const visibleHistory = showAllHistory ? history : history.slice(0, 8);
+
+    function statusTone(status) {
+        if (status === "CURRENT") return "success";
+        if (status === "PREVIOUSLY_USED") return "warning";
+        return "neutral";
+    }
+
+    function trendText(trend) {
+        if (!trend || trend.direction === "INSUFFICIENT_DATA") return "Not enough history";
+        if (trend.direction === "GROWING") return `Growing${trend.percentChange !== null ? ` (+${trend.percentChange}%)` : ""}`;
+        if (trend.direction === "DECLINING") return `Declining${trend.percentChange !== null ? ` (${trend.percentChange}%)` : ""}`;
+        return trend.percentChange !== null ? `Stable (${trend.percentChange > 0 ? "+" : ""}${trend.percentChange}%)` : "Stable";
+    }
+
+    function priorityTone(priority) {
+        if (priority === "HIGH") return "warning";
+        if (priority === "MEDIUM") return "info";
+        return "neutral";
+    }
+
+    function historyForRequested(product) {
+        return history.find(item => normalizeUiProductName(item.productName) === normalizeUiProductName(product?.name));
+    }
+
+    return (
+        <Card
+            title="Account Insights & Recommendations"
+            subtitle="Customer-safe talking points grounded in Salesforce Product Usage and the current conversation. No Salesforce records are changed on this step."
+            footer={
+                <>
+                    <Button disabled={busy} onClick={onBack}>Back</Button>
+                    <Button variant="primary" disabled={busy} onClick={onContinue}>
+                        {busy ? "Finding Opportunities…" : "Continue to Opportunity"}
+                    </Button>
+                </>
+            }
+        >
+            <div className="insights-page">
+                <div className="insight-summary-grid">
+                    <div className="insight-summary-card">
+                        <span>Account</span>
+                        <strong>{insights.account?.name || requirements.accountName || "—"}</strong>
+                    </div>
+                    <div className="insight-summary-card">
+                        <span>Latest Usage Period</span>
+                        <strong>{insights.latestUsagePeriod?.label || "No usage history"}</strong>
+                    </div>
+                    <div className="insight-summary-card">
+                        <span>Usage Records</span>
+                        <strong>{insights.usageRecordCount ?? 0}</strong>
+                    </div>
+                    <div className="insight-summary-card">
+                        <span>Recommendations</span>
+                        <strong>{recommendations.length}</strong>
+                    </div>
+                </div>
+
+                {insights.analysisNote ? <Alert tone="info">{insights.analysisNote}</Alert> : null}
+
+                <SectionTitle>Current Customer Request</SectionTitle>
+                <div className="table-wrap">
+                    <table>
+                        <thead>
+                            <tr><th>Product</th><th className="num">Qty</th><th>Salesforce context</th></tr>
+                        </thead>
+                        <tbody>
+                            {requestedProducts.map((product, index) => {
+                                const context = historyForRequested(product);
+                                return (
+                                    <tr key={`${product.name}-${index}`}>
+                                        <td><strong>{product.name}</strong></td>
+                                        <td className="num">{product.quantity ?? 1}</td>
+                                        <td>
+                                            {context ? <Badge tone={statusTone(context.status)}>{context.statusLabel}</Badge> : <Badge>No usage history</Badge>}
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+
+                <SectionTitle>Customer Product History</SectionTitle>
+                {history.length ? (
+                    <>
+                        <div className="table-wrap account-history-table">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Product</th>
+                                        <th>Status</th>
+                                        <th className="num">Latest / Last Usage</th>
+                                        <th>Last Period</th>
+                                        <th>Trend</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {visibleHistory.map((item) => (
+                                        <tr key={`${item.productId || item.productName}-${item.status}`}>
+                                            <td>
+                                                <strong>{item.productName}</strong>
+                                                {item.productFamily ? <div className="muted">{item.productFamily}</div> : null}
+                                                {item.requested ? <div className="history-requested-label">In current request</div> : null}
+                                            </td>
+                                            <td><Badge tone={statusTone(item.status)}>{item.statusLabel}</Badge></td>
+                                            <td className="num">{item.lastUsageAmount ?? "—"}</td>
+                                            <td>{item.lastUsagePeriod || "—"}</td>
+                                            <td>{trendText(item.trend)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                        {history.length > 8 ? (
+                            <div className="history-toggle-row">
+                                <Button onClick={() => setShowAllHistory(value => !value)}>
+                                    {showAllHistory ? "Show Less" : `Show All ${history.length} Products`}
+                                </Button>
+                            </div>
+                        ) : null}
+                    </>
+                ) : (
+                    <Alert tone="info">No Product Usage history was found for this account. Requested products are still shown as new-service context.</Alert>
+                )}
+
+                <SectionTitle>Recommended Customer Conversations</SectionTitle>
+                {recommendations.length ? (
+                    <div className="recommendation-list">
+                        {recommendations.map((recommendation) => {
+                            const isAccepted = accepted.has(recommendation.id);
+                            const isDismissed = dismissed.has(recommendation.id);
+                            return (
+                                <article
+                                    className={`recommendation-card${isDismissed ? " recommendation-card-dismissed" : ""}`}
+                                    key={recommendation.id}
+                                >
+                                    <div className="recommendation-header">
+                                        <div>
+                                            <div className="recommendation-label-row">
+                                                <Badge tone={priorityTone(recommendation.priority)}>{recommendation.priority} priority</Badge>
+                                                <span className="recommendation-category">{recommendation.label}</span>
+                                            </div>
+                                            <h3>{recommendation.title}</h3>
+                                        </div>
+                                        {recommendation.requestedByCustomer ? <Badge tone="success">Already requested</Badge> : null}
+                                        {isAccepted ? <Badge tone="success">Added for quote review</Badge> : null}
+                                        {isDismissed ? <Badge>Dismissed</Badge> : null}
+                                    </div>
+
+                                    <p className="recommendation-insight">{recommendation.aeInsight}</p>
+
+                                    <div className="talking-point">
+                                        <span>Suggested customer talking point</span>
+                                        <p>“{recommendation.customerTalkingPoint}”</p>
+                                    </div>
+
+                                    {recommendation.evidence?.length ? (
+                                        <details className="recommendation-evidence">
+                                            <summary>Why this surfaced</summary>
+                                            <ul>
+                                                {recommendation.evidence.map((evidence, index) => <li key={`${recommendation.id}-evidence-${index}`}>{evidence}</li>)}
+                                            </ul>
+                                        </details>
+                                    ) : null}
+
+                                    <div className="recommendation-actions">
+                                        {isDismissed ? (
+                                            <Button disabled={busy} onClick={() => onRestoreRecommendation(recommendation)}>Restore</Button>
+                                        ) : (
+                                            <>
+                                                {recommendation.canAddToRequest && !isAccepted ? (
+                                                    <Button variant="primary" disabled={busy} onClick={() => onAddRecommendation(recommendation)}>
+                                                        Add for Quote Review
+                                                    </Button>
+                                                ) : null}
+                                                {recommendation.canAddToRequest && isAccepted ? (
+                                                    <Button disabled={busy} onClick={() => onRemoveRecommendation(recommendation)}>
+                                                        Remove from Review
+                                                    </Button>
+                                                ) : null}
+                                                <Button disabled={busy || isAccepted} onClick={() => onDismissRecommendation(recommendation)}>
+                                                    Dismiss
+                                                </Button>
+                                            </>
+                                        )}
+                                    </div>
+                                </article>
+                            );
+                        })}
+                    </div>
+                ) : (
+                    <Alert tone="info">No additional conversation recommendations were produced from the available Product Usage history.</Alert>
+                )}
+
+                {insights.summary?.suppressedByExplicitExclusion ? (
+                    <Alert>
+                        {insights.summary.suppressedByExplicitExclusion} product insight(s) were suppressed because the customer explicitly excluded that product or service area in the current conversation.
+                    </Alert>
+                ) : null}
+            </div>
+        </Card>
+    );
+}
+
+function OpportunityView({ requirements, salesforce, selection, busy, onBack, onUseExisting, onSearch, onCreate }) {
     const opportunities = salesforce.matchingOpportunities || [];
     const pagination = salesforce.opportunityPagination || {
         page: 1,
@@ -530,125 +871,167 @@ function OpportunityView({ requirements, salesforce, selection, busy, onUseExist
 
     return (
         <Card title="Choose Opportunity" subtitle="Search and select an existing Salesforce Opportunity, or create a new one.">
-            <div className="opportunity-context-row">
-                {requirements.opportunityName ? (
-                    <Alert tone="info">Transcript mentioned: <strong>{requirements.opportunityName}</strong></Alert>
-                ) : null}
-                {salesforce.account?.name ? (
-                    <Alert tone="success">Salesforce Account found: <strong>{salesforce.account.name}</strong></Alert>
-                ) : null}
-            </div>
-
-            {salesforce.discoveryWarning ? (
-                <Alert tone="warning">{salesforce.discoveryWarning}</Alert>
-            ) : null}
-
-            {suggestedOpportunity ? (
-                <div className="suggested-opportunity">
-                    <div>
-                        <span className="suggested-label">Transcript match</span>
-                        <strong>{suggestedOpportunity.name}</strong>
-                        <span>{suggestedOpportunity.stageName || suggestedOpportunity.stage || "Stage not provided"} · {niceDate(suggestedOpportunity.closeDate)}</span>
-                    </div>
-                    <Button disabled={busy} variant="primary" onClick={() => onUseExisting(suggestedOpportunity)}>Use Opportunity</Button>
-                </div>
-            ) : null}
-
-            <div className="opportunity-toolbar">
-                <form className="opportunity-search" onSubmit={submitSearch}>
-                    <input
-                        aria-label="Search opportunities"
-                        value={searchTerm}
-                        onChange={(event) => setSearchTerm(event.target.value)}
-                        placeholder="Search opportunities by name..."
-                        disabled={busy}
-                    />
-                    <Button type="submit" disabled={busy}>Search</Button>
-                    {pagination.searchTerm ? <Button type="button" disabled={busy} onClick={clearSearch}>Clear</Button> : null}
-                </form>
-                <Button
-                    variant="primary"
-                    disabled={busy}
-                    onClick={() => setMode((current) => current === "create" ? "list" : "create")}
-                >
-                    {mode === "create" ? "Back to Opportunities" : "Create New Opportunity"}
-                </Button>
-            </div>
-
-            {mode === "create" ? (
-                <div className="form-panel opportunity-create-panel">
-                    <SectionTitle>New Opportunity</SectionTitle>
-                    <label>
-                        <span>Opportunity Name</span>
-                        <input value={name} onChange={(e) => setName(e.target.value)} />
-                    </label>
-                    <div className="grid two">
-                        <label>
-                            <span>Stage</span>
-                            <input value={stageName} onChange={(e) => setStageName(e.target.value)} />
-                        </label>
-                        <label>
-                            <span>Close Date</span>
-                            <input type="date" value={closeDate} onChange={(e) => setCloseDate(e.target.value)} />
-                        </label>
-                    </div>
-                    <div className="actions">
-                        <Button disabled={busy} onClick={() => setMode("list")}>Cancel</Button>
-                        <Button
-                            variant="primary"
-                            disabled={busy || !name || !stageName || !closeDate}
-                            onClick={() => onCreate({ name, stageName, closeDate })}
-                        >
-                            Create Opportunity
-                        </Button>
-                    </div>
-                </div>
-            ) : (
-                <>
-                    <div className="opportunity-list-meta">
-                        <span>
-                            {pagination.totalCount
-                                ? `${pagination.totalCount} opportunit${pagination.totalCount === 1 ? "y" : "ies"}`
-                                : "No opportunities found"}
-                            {pagination.searchTerm ? ` matching “${pagination.searchTerm}”` : ""}
-                        </span>
-                        {pagination.totalPages > 1 ? <span>Page {pagination.page} of {pagination.totalPages}</span> : null}
-                    </div>
-
-                    <div className="opportunity-list" role="list">
-                        {visibleOpportunities.map((opportunity) => (
-                            <div className="opportunity-row" role="listitem" key={opportunity.id || opportunity.name}>
-                                <div className="opportunity-row-main">
-                                    <strong>{opportunity.name}</strong>
-                                    <span className="muted">{opportunity.stageName || opportunity.stage || "Stage not provided"}</span>
-                                </div>
-                                <div className="opportunity-row-date">
-                                    <span className="opportunity-row-label">Close date</span>
-                                    <strong>{niceDate(opportunity.closeDate)}</strong>
-                                </div>
-                                <RecordId>{opportunity.id}</RecordId>
-                                <Button disabled={busy} onClick={() => onUseExisting(opportunity)}>Use</Button>
-                            </div>
-                        ))}
-                    </div>
-
-                    {!visibleOpportunities.length ? (
-                        <Alert>
-                            {pagination.searchTerm
-                                ? "No Opportunities match this search. Try another name or create a new Opportunity."
-                                : "No existing Opportunity was found for this Salesforce Account. You can create a new one."}
-                        </Alert>
-                    ) : null}
-
-                    {(pagination.hasPrevious || pagination.hasNext) ? (
-                        <div className="opportunity-pagination">
-                            <Button disabled={busy || !pagination.hasPrevious} onClick={() => changePage(pagination.page - 1)}>Previous</Button>
-                            <span>Page {pagination.page}{pagination.totalPages ? ` of ${pagination.totalPages}` : ""}</span>
-                            <Button disabled={busy || !pagination.hasNext} onClick={() => changePage(pagination.page + 1)}>Next</Button>
+            <div className="opportunity-page">
+                <div className="opportunity-context-strip">
+                    {requirements.opportunityName ? (
+                        <div className="context-chip context-chip-info">
+                            <span className="context-chip-label">Transcript mentioned</span>
+                            <strong>{requirements.opportunityName}</strong>
                         </div>
                     ) : null}
-                </>
-            )}
+                    {salesforce.account?.name ? (
+                        <div className="context-chip context-chip-success">
+                            <span className="context-chip-label">Salesforce account</span>
+                            <strong>{salesforce.account.name}</strong>
+                        </div>
+                    ) : null}
+                </div>
+
+                {salesforce.discoveryWarning ? (
+                    <Alert tone="warning">{salesforce.discoveryWarning}</Alert>
+                ) : null}
+
+                {suggestedOpportunity ? (
+                    <section className="opportunity-highlight" aria-label="Suggested transcript match">
+                        <div className="opportunity-highlight-icon" aria-hidden="true">★</div>
+                        <div className="opportunity-highlight-content">
+                            <span className="suggested-label">Best transcript match</span>
+                            <strong className="opportunity-highlight-name">{suggestedOpportunity.name}</strong>
+                            <div className="opportunity-highlight-meta">
+                                <span className="stage-pill">{suggestedOpportunity.stageName || suggestedOpportunity.stage || "Stage not provided"}</span>
+                                <span>{niceDate(suggestedOpportunity.closeDate)}</span>
+                            </div>
+                        </div>
+                        <Button disabled={busy} variant="primary" onClick={() => onUseExisting(suggestedOpportunity)}>Use Opportunity</Button>
+                    </section>
+                ) : null}
+
+                <div className="opportunity-controls">
+                    <Button type="button" disabled={busy} onClick={onBack}>Back</Button>
+                    <form className="opportunity-search" onSubmit={submitSearch}>
+                        <div className="search-field-wrap">
+                            <span className="search-icon" aria-hidden="true">⌕</span>
+                            <input
+                                aria-label="Search opportunities"
+                                value={searchTerm}
+                                onChange={(event) => setSearchTerm(event.target.value)}
+                                placeholder="Search opportunities by name..."
+                                disabled={busy}
+                            />
+                        </div>
+                        <Button type="submit" disabled={busy}>Search</Button>
+                        {pagination.searchTerm ? <Button type="button" disabled={busy} onClick={clearSearch}>Clear</Button> : null}
+                    </form>
+                    <Button
+                        variant="primary"
+                        disabled={busy}
+                        onClick={() => setMode((current) => current === "create" ? "list" : "create")}
+                    >
+                        {mode === "create" ? "Back to Opportunities" : "Create New Opportunity"}
+                    </Button>
+                </div>
+
+                {mode === "create" ? (
+                    <div className="opportunity-create-panel">
+                        <div className="create-panel-header">
+                            <div>
+                                <span className="create-panel-kicker">New Salesforce record</span>
+                                <h3>Create Opportunity</h3>
+                                <p>Review the values below before creating the Opportunity.</p>
+                            </div>
+                        </div>
+                        <label>
+                            <span>Opportunity Name</span>
+                            <input value={name} onChange={(e) => setName(e.target.value)} />
+                        </label>
+                        <div className="grid two">
+                            <label>
+                                <span>Stage</span>
+                                <input value={stageName} onChange={(e) => setStageName(e.target.value)} />
+                            </label>
+                            <label>
+                                <span>Close Date</span>
+                                <input type="date" value={closeDate} onChange={(e) => setCloseDate(e.target.value)} />
+                            </label>
+                        </div>
+                        <div className="actions create-panel-actions">
+                            <Button disabled={busy} onClick={() => setMode("list")}>Cancel</Button>
+                            <Button
+                                variant="primary"
+                                disabled={busy || !name || !stageName || !closeDate}
+                                onClick={() => onCreate({ name, stageName, closeDate })}
+                            >
+                                Create Opportunity
+                            </Button>
+                        </div>
+                    </div>
+                ) : (
+                    <>
+                        <div className="opportunity-list-heading">
+                            <div>
+                                <span className="opportunity-list-kicker">Available opportunities</span>
+                                <strong>
+                                    {pagination.totalCount
+                                        ? `${pagination.totalCount} opportunit${pagination.totalCount === 1 ? "y" : "ies"}`
+                                        : "No opportunities found"}
+                                </strong>
+                                {pagination.searchTerm ? <span className="muted">Matching “{pagination.searchTerm}”</span> : null}
+                            </div>
+                            {pagination.totalPages > 1 ? <span className="page-badge">Page {pagination.page} of {pagination.totalPages}</span> : null}
+                        </div>
+
+                        <div className="opportunity-table-shell">
+                            <div className="opportunity-table-head" aria-hidden="true">
+                                <span>Opportunity</span>
+                                <span>Stage</span>
+                                <span>Close date</span>
+                                <span>Salesforce ID</span>
+                                <span></span>
+                            </div>
+                            <div className="opportunity-list" role="list">
+                                {visibleOpportunities.map((opportunity) => (
+                                    <div className="opportunity-row" role="listitem" key={opportunity.id || opportunity.name}>
+                                        <div className="opportunity-row-main">
+                                            <strong>{opportunity.name}</strong>
+                                            <span className="opportunity-row-subtext">Existing Salesforce Opportunity</span>
+                                        </div>
+                                        <div><span className="stage-pill">{opportunity.stageName || opportunity.stage || "Stage not provided"}</span></div>
+                                        <div className="opportunity-row-date">
+                                            <span className="mobile-row-label">Close date</span>
+                                            <strong>{niceDate(opportunity.closeDate)}</strong>
+                                        </div>
+                                        <div className="opportunity-row-id">
+                                            <span className="mobile-row-label">Salesforce ID</span>
+                                            <RecordId>{opportunity.id}</RecordId>
+                                        </div>
+                                        <Button disabled={busy} onClick={() => onUseExisting(opportunity)}>Use</Button>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        {!visibleOpportunities.length ? (
+                            <div className="empty-opportunity-state">
+                                <div className="empty-state-icon" aria-hidden="true">⌕</div>
+                                <strong>No matching opportunities</strong>
+                                <span>
+                                    {pagination.searchTerm
+                                        ? "Try another Opportunity name, clear the search, or create a new Opportunity."
+                                        : "No existing Opportunity was found for this Salesforce Account. You can create a new one."}
+                                </span>
+                            </div>
+                        ) : null}
+
+                        {(pagination.hasPrevious || pagination.hasNext) ? (
+                            <div className="opportunity-pagination">
+                                <Button disabled={busy || !pagination.hasPrevious} onClick={() => changePage(pagination.page - 1)}>Previous</Button>
+                                <span className="pagination-status">Page {pagination.page}{pagination.totalPages ? ` of ${pagination.totalPages}` : ""}</span>
+                                <Button disabled={busy || !pagination.hasNext} onClick={() => changePage(pagination.page + 1)}>Next</Button>
+                            </div>
+                        ) : null}
+                    </>
+                )}
+            </div>
         </Card>
     );
 }
@@ -667,14 +1050,42 @@ function OperationSummaryView({ summary, fallbackRecord, busy, onBack, onContinu
                 </>
             }
         >
-            {summary.message ? <Alert tone="success">{summary.message}</Alert> : null}
-            <div className="grid two">
-                <Field label="Opportunity" value={record.name} />
-                <Field label="Account" value={record.accountName} />
-                <Field label="Stage" value={record.stageName || record.stage} />
-                <Field label="Close Date" value={niceDate(record.closeDate)} />
+            <div className="opportunity-summary-page">
+                <div className="summary-hero">
+                    <div className="summary-hero-icon" aria-hidden="true">✓</div>
+                    <div>
+                        <span className="summary-hero-kicker">Selection confirmed</span>
+                        <strong>{record.name || "Opportunity"}</strong>
+                        <p>{summary.message || "This Opportunity will be used for the quote."}</p>
+                    </div>
+                </div>
+
+                <div className="summary-detail-grid">
+                    <div className="summary-detail-card">
+                        <span>Opportunity</span>
+                        <strong>{record.name || "—"}</strong>
+                    </div>
+                    <div className="summary-detail-card">
+                        <span>Account</span>
+                        <strong>{record.accountName || "—"}</strong>
+                    </div>
+                    <div className="summary-detail-card">
+                        <span>Stage</span>
+                        <div><span className="stage-pill stage-pill-success">{record.stageName || record.stage || "—"}</span></div>
+                    </div>
+                    <div className="summary-detail-card">
+                        <span>Close Date</span>
+                        <strong>{niceDate(record.closeDate)}</strong>
+                    </div>
+                </div>
+
+                {record.id ? (
+                    <div className="summary-record-strip">
+                        <span>Salesforce Opportunity ID</span>
+                        <RecordId>{record.id}</RecordId>
+                    </div>
+                ) : null}
             </div>
-            {record.id ? <Field label="Salesforce ID"><RecordId>{record.id}</RecordId></Field> : null}
         </Card>
     );
 }

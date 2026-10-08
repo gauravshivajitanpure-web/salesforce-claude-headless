@@ -1493,3 +1493,330 @@ th {
     }
 }
 
+
+
+.shell.shell-wide {
+    width: min(1320px, 100%);
+}
+
+/* =========================================================
+   Compact wide Account Insights layout
+   UI-only update: no workflow or Salesforce behavior changes.
+   ========================================================= */
+
+.insights-upper-grid {
+    display: grid;
+    grid-template-columns: minmax(320px, .78fr) minmax(620px, 1.55fr);
+    gap: 16px;
+    align-items: start;
+}
+
+.insights-panel {
+    min-width: 0;
+}
+
+.insights-panel > .section-title {
+    margin-top: 0;
+}
+
+.current-request-table table,
+.account-history-table table {
+    font-size: 12px;
+}
+
+.current-request-table th,
+.current-request-table td,
+.account-history-table th,
+.account-history-table td {
+    padding: 9px 10px;
+}
+
+.recommendation-table-wrap {
+    overflow-x: auto;
+    border-color: #dddbda;
+}
+
+.recommendation-table {
+    min-width: 1180px;
+    table-layout: fixed;
+    font-size: 12px;
+}
+
+.recommendation-table th,
+.recommendation-table td {
+    vertical-align: top;
+    padding: 11px 12px;
+}
+
+.recommendation-table th:nth-child(1) { width: 11%; }
+.recommendation-table th:nth-child(2) { width: 18%; }
+.recommendation-table th:nth-child(3) { width: 20%; }
+.recommendation-table th:nth-child(4) { width: 25%; }
+.recommendation-table th:nth-child(5) { width: 12%; }
+.recommendation-table th:nth-child(6) { width: 14%; }
+
+.recommendation-priority-cell,
+.recommendation-status-stack {
+    display: grid;
+    justify-items: start;
+    gap: 6px;
+}
+
+.recommendation-category {
+    line-height: 1.35;
+}
+
+.recommendation-table-title {
+    display: block;
+    color: var(--sf-navy);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.recommendation-table-copy {
+    color: #3e4a56;
+    line-height: 1.5;
+}
+
+.recommendation-table-talking-point {
+    padding: 8px 9px;
+    border: 1px solid #b5d9f6;
+    border-radius: 9px;
+    background: var(--sf-blue-soft);
+    color: var(--sf-navy);
+    line-height: 1.5;
+}
+
+.recommendation-table-evidence {
+    margin-top: 7px;
+}
+
+.recommendation-table-evidence summary {
+    width: fit-content;
+    color: var(--sf-blue-dark);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 750;
+}
+
+.recommendation-table-evidence ul {
+    margin: 7px 0 0;
+    padding-left: 17px;
+    color: #5c5c5c;
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.recommendation-table-actions {
+    display: grid;
+    gap: 7px;
+    align-content: start;
+}
+
+.recommendation-table-actions .button {
+    width: 100%;
+    padding: 7px 9px;
+    font-size: 11px;
+    line-height: 1.25;
+}
+
+.recommendation-row-dismissed {
+    opacity: .62;
+    background: #f8f8f8;
+}
+
+.recommendation-row-dismissed .recommendation-table-talking-point {
+    background: #f3f3f3;
+    border-color: #dddbda;
+}
+
+@media (max-width: 1100px) {
+    .insights-upper-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 760px) {
+    .shell.shell-wide {
+        width: 100%;
+    }
+
+    .recommendation-table {
+        min-width: 1050px;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    .recommendation-table-title {
+        color: #eef6fc;
+    }
+
+    .recommendation-table-copy,
+    .recommendation-table-evidence ul {
+        color: #b8c7d2;
+    }
+
+    .recommendation-table-talking-point {
+        background: #173650;
+        border-color: #275b7f;
+        color: #eef6fc;
+    }
+
+    .recommendation-row-dismissed {
+        background: #272c35;
+    }
+
+    .recommendation-row-dismissed .recommendation-table-talking-point {
+        background: #242933;
+        border-color: #3b424e;
+    }
+}
+
+/* =========================================================
+   Laptop-responsive / expandable Account Insights
+   Uses the full MCP container width and supports fullscreen mode
+   when the host exposes it. Other workspace views keep their
+   existing layout and workflow behavior.
+   ========================================================= */
+
+.workspace-header-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+/* Use every pixel the inline MCP host gives us. The host itself may
+   still cap an inline app's message-column width. */
+.shell.shell-wide {
+    width: min(1500px, calc(100vw - 16px));
+    max-width: 100%;
+    padding-left: 8px;
+    padding-right: 8px;
+}
+
+/* Fullscreen is the standards-based way to use the wider laptop viewport
+   when the MCP host supports it. */
+.shell.shell-fullscreen {
+    width: min(1720px, calc(100vw - 28px));
+    max-width: none;
+    padding: 18px 14px 28px;
+}
+
+.shell.shell-fullscreen > .card {
+    width: 100%;
+}
+
+.shell.shell-fullscreen .insights-page {
+    gap: 16px;
+}
+
+/* Four summary tiles remain on one row for normal laptop widths. */
+.shell-wide .insight-summary-grid {
+    grid-template-columns: repeat(4, minmax(150px, 1fr));
+}
+
+/* Wide laptops: keep request and history side-by-side. */
+.shell-wide .insights-upper-grid {
+    grid-template-columns: minmax(300px, .72fr) minmax(600px, 1.6fr);
+    gap: 14px;
+}
+
+/* Use available width rather than forcing horizontal scrolling on
+   1366/1440/1600px laptop screens. */
+.shell-fullscreen .recommendation-table {
+    min-width: 0;
+    width: 100%;
+    table-layout: fixed;
+}
+
+.shell-fullscreen .recommendation-table th:nth-child(1) { width: 9%; }
+.shell-fullscreen .recommendation-table th:nth-child(2) { width: 18%; }
+.shell-fullscreen .recommendation-table th:nth-child(3) { width: 20%; }
+.shell-fullscreen .recommendation-table th:nth-child(4) { width: 27%; }
+.shell-fullscreen .recommendation-table th:nth-child(5) { width: 12%; }
+.shell-fullscreen .recommendation-table th:nth-child(6) { width: 14%; }
+
+.shell-fullscreen .recommendation-table th,
+.shell-fullscreen .recommendation-table td {
+    padding: 10px;
+}
+
+/* Large laptop / desktop */
+@media (min-width: 1440px) {
+    .shell.shell-fullscreen {
+        width: min(1680px, calc(100vw - 40px));
+        padding-left: 20px;
+        padding-right: 20px;
+    }
+
+    .shell-fullscreen .insights-upper-grid {
+        grid-template-columns: minmax(340px, .7fr) minmax(760px, 1.7fr);
+        gap: 18px;
+    }
+}
+
+/* Standard 13-15 inch laptop widths. */
+@media (min-width: 1180px) and (max-width: 1439px) {
+    .shell.shell-fullscreen {
+        width: calc(100vw - 24px);
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    .shell-fullscreen .insights-upper-grid {
+        grid-template-columns: minmax(280px, .72fr) minmax(560px, 1.5fr);
+        gap: 12px;
+    }
+
+    .shell-fullscreen .recommendation-table {
+        font-size: 11.5px;
+    }
+
+    .shell-fullscreen .recommendation-table th,
+    .shell-fullscreen .recommendation-table td {
+        padding: 9px;
+    }
+
+    .shell-fullscreen .recommendation-table-talking-point {
+        padding: 7px 8px;
+    }
+}
+
+/* Smaller laptops / split-screen windows: stack the two top tables but
+   preserve the recommendation table with horizontal scrolling. */
+@media (max-width: 1179px) {
+    .shell-wide .insights-upper-grid,
+    .shell-fullscreen .insights-upper-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .shell-fullscreen .recommendation-table,
+    .shell-wide .recommendation-table {
+        min-width: 1040px;
+    }
+}
+
+@media (max-width: 900px) {
+    .shell-wide .insight-summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .workspace-header-actions {
+        align-items: flex-end;
+    }
+}
+
+@media (max-width: 700px) {
+    .shell.shell-wide,
+    .shell.shell-fullscreen {
+        width: 100%;
+        padding: 10px;
+    }
+
+    .workspace-header-actions {
+        width: 100%;
+        justify-content: space-between;
+    }
+}

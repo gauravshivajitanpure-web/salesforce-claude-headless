@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "@modelcontextprotocol/ext-apps/react";
 import {
     Alert,
@@ -112,6 +112,8 @@ export default function App() {
     const [workingData, setWorkingData] = useState({});
     const [busy, setBusy] = useState(false);
     const [errorMessage, setErrorMessage] = useState("");
+    const [displayMode, setDisplayMode] = useState("inline");
+    const [canFullscreen, setCanFullscreen] = useState(false);
     const hydratedWorkflows = useRef(new Set());
 
     function applyStructuredPayload(structured) {
@@ -126,7 +128,7 @@ export default function App() {
 
     const { app, isConnected, error } = useApp({
         appInfo: { name: "Salesforce Revenue Workspace", version: "3.0.0" },
-        capabilities: {},
+        capabilities: { availableDisplayModes: ["inline", "fullscreen"] },
         onAppCreated: (createdApp) => {
             createdApp.ontoolresult = (result) => {
                 const structured = result?.structuredContent;
@@ -154,8 +156,35 @@ export default function App() {
                     console.warn("Could not restore Revenue Workspace state", restoreError);
                 });
             };
+
+            createdApp.onhostcontextchanged = (ctx) => {
+                if (ctx?.displayMode) setDisplayMode(ctx.displayMode);
+                if (Array.isArray(ctx?.availableDisplayModes)) {
+                    setCanFullscreen(ctx.availableDisplayModes.includes("fullscreen"));
+                }
+            };
         }
     });
+
+    useEffect(() => {
+        if (!app || !isConnected) return;
+        const ctx = app.getHostContext?.();
+        if (ctx?.displayMode) setDisplayMode(ctx.displayMode);
+        if (Array.isArray(ctx?.availableDisplayModes)) {
+            setCanFullscreen(ctx.availableDisplayModes.includes("fullscreen"));
+        }
+    }, [app, isConnected]);
+
+    async function toggleDisplayMode() {
+        if (!app || !canFullscreen) return;
+        try {
+            const nextMode = displayMode === "fullscreen" ? "inline" : "fullscreen";
+            const result = await app.requestDisplayMode({ mode: nextMode });
+            if (result?.mode) setDisplayMode(result.mode);
+        } catch (displayError) {
+            setErrorMessage(`Could not change workspace display mode: ${displayError?.message || String(displayError)}`);
+        }
+    }
 
     const workflowId = payload.workflowId || "workflow";
     const data = workingData || {};
@@ -344,13 +373,19 @@ export default function App() {
     }
 
     return (
-        <main className="shell">
+        <main className={`shell${view === "insights" ? " shell-wide" : ""}${displayMode === "fullscreen" ? " shell-fullscreen" : ""}`}>
             <div className="workspace-header">
                 <div>
                     <div className="eyebrow">Salesforce Revenue Cloud</div>
                     <h1>Revenue Workspace</h1>
                 </div>
-                <Badge tone="info">{workflowId}</Badge>
+                <div className="workspace-header-actions">
+                    {canFullscreen ? (
+                        <Button onClick={toggleDisplayMode}>
+                            {displayMode === "fullscreen" ? "Exit Full Screen" : "Expand Workspace"}
+                        </Button>
+                    ) : null}
+                </div>
             </div>
 
             <Progress view={view} />
@@ -680,136 +715,162 @@ function AccountInsightsView({
 
                 {insights.analysisNote ? <Alert tone="info">{insights.analysisNote}</Alert> : null}
 
-                <SectionTitle>Current Customer Request</SectionTitle>
-                <div className="table-wrap">
-                    <table>
-                        <thead>
-                            <tr><th>Product</th><th className="num">Qty</th><th>Salesforce context</th></tr>
-                        </thead>
-                        <tbody>
-                            {requestedProducts.map((product, index) => {
-                                const context = historyForRequested(product);
-                                return (
-                                    <tr key={`${product.name}-${index}`}>
-                                        <td><strong>{product.name}</strong></td>
-                                        <td className="num">{product.quantity ?? 1}</td>
-                                        <td>
-                                            {context ? <Badge tone={statusTone(context.status)}>{context.statusLabel}</Badge> : <Badge>No usage history</Badge>}
-                                        </td>
-                                    </tr>
-                                );
-                            })}
-                        </tbody>
-                    </table>
-                </div>
-
-                <SectionTitle>Customer Product History</SectionTitle>
-                {history.length ? (
-                    <>
-                        <div className="table-wrap account-history-table">
+                <div className="insights-upper-grid">
+                    <section className="insights-panel">
+                        <SectionTitle>Current Customer Request</SectionTitle>
+                        <div className="table-wrap current-request-table">
                             <table>
                                 <thead>
-                                    <tr>
-                                        <th>Product</th>
-                                        <th>Status</th>
-                                        <th className="num">Latest / Last Usage</th>
-                                        <th>Last Period</th>
-                                        <th>Trend</th>
-                                    </tr>
+                                    <tr><th>Product</th><th className="num">Qty</th><th>Salesforce context</th></tr>
                                 </thead>
                                 <tbody>
-                                    {visibleHistory.map((item) => (
-                                        <tr key={`${item.productId || item.productName}-${item.status}`}>
-                                            <td>
-                                                <strong>{item.productName}</strong>
-                                                {item.productFamily ? <div className="muted">{item.productFamily}</div> : null}
-                                                {item.requested ? <div className="history-requested-label">In current request</div> : null}
-                                            </td>
-                                            <td><Badge tone={statusTone(item.status)}>{item.statusLabel}</Badge></td>
-                                            <td className="num">{item.lastUsageAmount ?? "—"}</td>
-                                            <td>{item.lastUsagePeriod || "—"}</td>
-                                            <td>{trendText(item.trend)}</td>
-                                        </tr>
-                                    ))}
+                                    {requestedProducts.map((product, index) => {
+                                        const context = historyForRequested(product);
+                                        return (
+                                            <tr key={`${product.name}-${index}`}>
+                                                <td><strong>{product.name}</strong></td>
+                                                <td className="num">{product.quantity ?? 1}</td>
+                                                <td>
+                                                    {context ? <Badge tone={statusTone(context.status)}>{context.statusLabel}</Badge> : <Badge>No usage history</Badge>}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
                                 </tbody>
                             </table>
                         </div>
-                        {history.length > 8 ? (
-                            <div className="history-toggle-row">
-                                <Button onClick={() => setShowAllHistory(value => !value)}>
-                                    {showAllHistory ? "Show Less" : `Show All ${history.length} Products`}
-                                </Button>
-                            </div>
-                        ) : null}
-                    </>
-                ) : (
-                    <Alert tone="info">No Product Usage history was found for this account. Requested products are still shown as new-service context.</Alert>
-                )}
+                    </section>
+
+                    <section className="insights-panel insights-history-panel">
+                        <SectionTitle>Customer Product History</SectionTitle>
+                        {history.length ? (
+                            <>
+                                <div className="table-wrap account-history-table">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Product</th>
+                                                <th>Status</th>
+                                                <th className="num">Latest / Last Usage</th>
+                                                <th>Last Period</th>
+                                                <th>Trend</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {visibleHistory.map((item) => (
+                                                <tr key={`${item.productId || item.productName}-${item.status}`}>
+                                                    <td>
+                                                        <strong>{item.productName}</strong>
+                                                        {item.productFamily ? <div className="muted">{item.productFamily}</div> : null}
+                                                        {item.requested ? <div className="history-requested-label">In current request</div> : null}
+                                                    </td>
+                                                    <td><Badge tone={statusTone(item.status)}>{item.statusLabel}</Badge></td>
+                                                    <td className="num">{item.lastUsageAmount ?? "—"}</td>
+                                                    <td>{item.lastUsagePeriod || "—"}</td>
+                                                    <td>{trendText(item.trend)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                {history.length > 8 ? (
+                                    <div className="history-toggle-row">
+                                        <Button onClick={() => setShowAllHistory(value => !value)}>
+                                            {showAllHistory ? "Show Less" : `Show All ${history.length} Products`}
+                                        </Button>
+                                    </div>
+                                ) : null}
+                            </>
+                        ) : (
+                            <Alert tone="info">No Product Usage history was found for this account. Requested products are still shown as new-service context.</Alert>
+                        )}
+                    </section>
+                </div>
 
                 <SectionTitle>Recommended Customer Conversations</SectionTitle>
                 {recommendations.length ? (
-                    <div className="recommendation-list">
-                        {recommendations.map((recommendation) => {
-                            const isAccepted = accepted.has(recommendation.id);
-                            const isDismissed = dismissed.has(recommendation.id);
-                            return (
-                                <article
-                                    className={`recommendation-card${isDismissed ? " recommendation-card-dismissed" : ""}`}
-                                    key={recommendation.id}
-                                >
-                                    <div className="recommendation-header">
-                                        <div>
-                                            <div className="recommendation-label-row">
-                                                <Badge tone={priorityTone(recommendation.priority)}>{recommendation.priority} priority</Badge>
-                                                <span className="recommendation-category">{recommendation.label}</span>
-                                            </div>
-                                            <h3>{recommendation.title}</h3>
-                                        </div>
-                                        {recommendation.requestedByCustomer ? <Badge tone="success">Already requested</Badge> : null}
-                                        {isAccepted ? <Badge tone="success">Added for quote review</Badge> : null}
-                                        {isDismissed ? <Badge>Dismissed</Badge> : null}
-                                    </div>
-
-                                    <p className="recommendation-insight">{recommendation.aeInsight}</p>
-
-                                    <div className="talking-point">
-                                        <span>Suggested customer talking point</span>
-                                        <p>“{recommendation.customerTalkingPoint}”</p>
-                                    </div>
-
-                                    {recommendation.evidence?.length ? (
-                                        <details className="recommendation-evidence">
-                                            <summary>Why this surfaced</summary>
-                                            <ul>
-                                                {recommendation.evidence.map((evidence, index) => <li key={`${recommendation.id}-evidence-${index}`}>{evidence}</li>)}
-                                            </ul>
-                                        </details>
-                                    ) : null}
-
-                                    <div className="recommendation-actions">
-                                        {isDismissed ? (
-                                            <Button disabled={busy} onClick={() => onRestoreRecommendation(recommendation)}>Restore</Button>
-                                        ) : (
-                                            <>
-                                                {recommendation.canAddToRequest && !isAccepted ? (
-                                                    <Button variant="primary" disabled={busy} onClick={() => onAddRecommendation(recommendation)}>
-                                                        Add for Quote Review
-                                                    </Button>
+                    <div className="table-wrap recommendation-table-wrap">
+                        <table className="recommendation-table">
+                            <thead>
+                                <tr>
+                                    <th>Priority</th>
+                                    <th>Conversation</th>
+                                    <th>AE Insight</th>
+                                    <th>Suggested Customer Talking Point</th>
+                                    <th>Status</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {recommendations.map((recommendation) => {
+                                    const isAccepted = accepted.has(recommendation.id);
+                                    const isDismissed = dismissed.has(recommendation.id);
+                                    return (
+                                        <tr
+                                            className={isDismissed ? "recommendation-row-dismissed" : ""}
+                                            key={recommendation.id}
+                                        >
+                                            <td>
+                                                <div className="recommendation-priority-cell">
+                                                    <Badge tone={priorityTone(recommendation.priority)}>{recommendation.priority}</Badge>
+                                                    <span className="recommendation-category">{recommendation.label}</span>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <strong className="recommendation-table-title">{recommendation.title}</strong>
+                                                {recommendation.evidence?.length ? (
+                                                    <details className="recommendation-table-evidence">
+                                                        <summary>Why this surfaced</summary>
+                                                        <ul>
+                                                            {recommendation.evidence.map((evidence, index) => (
+                                                                <li key={`${recommendation.id}-evidence-${index}`}>{evidence}</li>
+                                                            ))}
+                                                        </ul>
+                                                    </details>
                                                 ) : null}
-                                                {recommendation.canAddToRequest && isAccepted ? (
-                                                    <Button disabled={busy} onClick={() => onRemoveRecommendation(recommendation)}>
-                                                        Remove from Review
-                                                    </Button>
-                                                ) : null}
-                                                <Button disabled={busy || isAccepted} onClick={() => onDismissRecommendation(recommendation)}>
-                                                    Dismiss
-                                                </Button>
-                                            </>
-                                        )}
-                                    </div>
-                                </article>
-                            );
-                        })}
+                                            </td>
+                                            <td className="recommendation-table-copy">{recommendation.aeInsight}</td>
+                                            <td>
+                                                <div className="recommendation-table-talking-point">
+                                                    “{recommendation.customerTalkingPoint}”
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <div className="recommendation-status-stack">
+                                                    {recommendation.requestedByCustomer ? <Badge tone="success">Already requested</Badge> : null}
+                                                    {isAccepted ? <Badge tone="success">Added for quote review</Badge> : null}
+                                                    {isDismissed ? <Badge>Dismissed</Badge> : null}
+                                                    {!recommendation.requestedByCustomer && !isAccepted && !isDismissed ? <Badge>Suggested</Badge> : null}
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <div className="recommendation-table-actions">
+                                                    {isDismissed ? (
+                                                        <Button disabled={busy} onClick={() => onRestoreRecommendation(recommendation)}>Restore</Button>
+                                                    ) : (
+                                                        <>
+                                                            {recommendation.canAddToRequest && !isAccepted ? (
+                                                                <Button variant="primary" disabled={busy} onClick={() => onAddRecommendation(recommendation)}>
+                                                                    Add for Quote Review
+                                                                </Button>
+                                                            ) : null}
+                                                            {recommendation.canAddToRequest && isAccepted ? (
+                                                                <Button disabled={busy} onClick={() => onRemoveRecommendation(recommendation)}>
+                                                                    Remove from Review
+                                                                </Button>
+                                                            ) : null}
+                                                            <Button disabled={busy || isAccepted} onClick={() => onDismissRecommendation(recommendation)}>
+                                                                Dismiss
+                                                            </Button>
+                                                        </>
+                                                    )}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
                     </div>
                 ) : (
                     <Alert tone="info">No additional conversation recommendations were produced from the available Product Usage history.</Alert>

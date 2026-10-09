@@ -1099,7 +1099,7 @@ async function analyzeAccountInsights(requirements) {
                 product: { id: item.productId, name: item.productName },
                 requestedByCustomer: false,
                 canAddToRequest: false,
-                aeInsight: `${item.productName} is currently a Asset, but recent usage has declined materially.`,
+                aeInsight: `${item.productName} has usage recorded in the latest account usage period, but recent usage has declined materially.`,
                 customerTalkingPoint: `We've seen ${item.productName} usage change recently. Has your usage pattern changed, or should we plan for a different level going forward?`,
                 evidence: [
                     item.lastUsageAmount !== null ? `Latest usage amount: ${item.lastUsageAmount}` : null,
@@ -1718,9 +1718,9 @@ async function buildRecommendationContext(data, pricebookId) {
                 const latest = ordered[ordered.length - 1];
                 const trend = calculateUsageTrend(ordered);
                 const latestPeriod = usagePeriodIndex(latest.year, latest.month);
-                const currentlyUsed = allLatest >= 0 && latestPeriod === allLatest;
+                const CuurentAsset = allLatest >= 0 && latestPeriod === allLatest;
                 const usageAmount = latest.usageAmount ?? 0;
-                const score = (currentlyUsed ? 25 : 0) + (trend.direction === "GROWING" ? 40 : 0) +
+                const score = (CuurentAsset ? 25 : 0) + (trend.direction === "GROWING" ? 40 : 0) +
                     (usageAmount > 500 ? 25 : 0) + (ordered.length > 1 ? 10 : 0);
                 candidates.push({
                     productId: e.Product2Id, pricebookEntryId: e.Id, name,
@@ -1729,7 +1729,7 @@ async function buildRecommendationContext(data, pricebookId) {
                     unitPrice: Number(e.UnitPrice), score,
                     usage: { recordCount: raw.length, lastUsageAmount: usageAmount,
                         lastUsagePeriod: usagePeriodLabel(latest.month, latest.year),
-                        current: currentlyUsed, trend, recent: ordered.slice(-4) }
+                        current: CuurentAsset, trend, recent: ordered.slice(-4) }
                 });
                 seen.add(e.Product2Id);
             }

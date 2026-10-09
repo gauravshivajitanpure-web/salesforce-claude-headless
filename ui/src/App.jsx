@@ -762,7 +762,7 @@ function AccountInsightsView({
                                                 <td><strong>{product.name}</strong></td>
                                                 <td className="num">{product.quantity ?? 1}</td>
                                                 <td>
-                                                    {context ? <Badge tone={statusTone(context.status)}>{context.statusLabel}</Badge> : <Badge>No usage history</Badge>}
+                                                    {context ? <Badge tone={statusTone(context.status)}>{context.status === "CURRENT" ? "Current Asset" : context.statusLabel}</Badge> : <Badge>No usage history</Badge>}
                                                 </td>
                                             </tr>
                                         );
@@ -795,7 +795,7 @@ function AccountInsightsView({
                                                         {item.productFamily ? <div className="muted">{item.productFamily}</div> : null}
                                                         {item.requested ? <div className="history-requested-label">In current request</div> : null}
                                                     </td>
-                                                    <td><Badge tone={statusTone(item.status)}>{item.statusLabel}</Badge></td>
+                                                    <td><Badge tone={statusTone(item.status)}>{item.status === "CURRENT" ? "Current Asset" : item.statusLabel}</Badge></td>
                                                     <td className="num">{item.lastUsageAmount ?? "—"}</td>
                                                     <td>{item.lastUsagePeriod || "—"}</td>
                                                     <td>{trendText(item.trend)}</td>
@@ -1318,7 +1318,7 @@ function ProductsView({ products, recommendations, recommendationSource, recomme
         finally { setSearchBusy(false); }
     }
     return (
-        <Card title="Product Configuration" subtitle="Manage quote products, quantities and AE discounts. Selling models are resolved by Salesforce, not selected here."
+        <Card title="Product Configuration" subtitle="Manage quote products, quantities and AE discounts."
             footer={<><Button onClick={onBack}>Back</Button><Button variant="primary" disabled={invalid || rows.length === 0} onClick={() => onContinue(rows.map(preparedProduct))}>Review Quote</Button></>}>
             <div className="product-workspace">
                 <div className="product-summary-strip">

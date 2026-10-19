@@ -533,6 +533,8 @@ export default function App() {
                     recommendationSource={aiSource}
                     recommendationBusy={recommendationBusy}
                     onRefreshRecommendations={loadRecommendations}
+                    app={app}
+                    workflowId={workflowId}
                                         catalog={salesforce.productCatalog || salesforce.availableProducts || []}
                     searchProducts={async (searchTerm) => {
                         const result = await app.callServerTool({
@@ -1250,7 +1252,7 @@ function preparedProduct(product) {
     };
 }
 
-function ProductsView({ products, recommendations, recommendationSource, recommendationBusy, onRefreshRecommendations, catalog, searchProducts, onBack, onContinue }) {
+function ProductsView({ products, recommendations, recommendationSource, recommendationBusy, onRefreshRecommendations, catalog, searchProducts, onBack, onContinue, app, workflowId }) {
     const [rows, setRows] = useState(() => clone(products));
     const [query, setQuery] = useState("");
     const [catalogResults, setCatalogResults] = useState(() => clone(catalog));
@@ -1361,9 +1363,97 @@ function ProductsView({ products, recommendations, recommendationSource, recomme
                         </div>
                     ) : null}
                 </section>
+                <AeClaudeChat app={app} workflowId={workflowId} onAddSuggestedProduct={addRecommendedProduct} selectedProductIds={chosen} draftProducts={rows} />
             </div>
         </Card>
     );
+}
+
+
+/* User-triggered Claude Desktop bridge. The host may show a safety confirmation.
+   The answer is saved through revenue_submit_ai_answer and polled back to the widget. */
+function AeClaudeChat({ app, workflowId, onAddSuggestedProduct, selectedProductIds, draftProducts }) {
+    const [open, setOpen] = useState(true);
+    const [question, setQuestion] = useState("");
+    const [messages, setMessages] = useState([]);
+    const [sending, setSending] = useState(false);
+    const [error, setError] = useState("");
+    const [adding, setAdding] = useState("");
+    const hasPending = messages.some(m => m.status === "pending");
+    useEffect(() => {
+        if (!app || !workflowId || workflowId === "workflow" || !open) return;
+        let live = true;
+        const refresh = async () => {
+            try {
+                const result = await app.callServerTool({name:"workspace_get_ai_messages", arguments:{workflowId}});
+                if(live && !result?.isError) setMessages(result?.structuredContent?.messages || []);
+            } catch(e) { /* Background refresh failure leaves existing messages visible. */ }
+        };
+        void refresh();
+        const timer = setInterval(refresh, hasPending ? 2500 : 7000);
+        return () => { live = false; clearInterval(timer); };
+    }, [app, workflowId, open, hasPending]);
+    async function sendQuestion(event) {
+        event.preventDefault();
+        const text = question.trim();
+        if (!text || sending) return;
+        setSending(true);setError("");
+        let questionId;
+        try {
+            const result = await app.callServerTool({name:"workspace_ask_claude",arguments:{workflowId,question:text,draftProducts:(draftProducts||[]).map(p=>({productId:p.productId||null,name:p.name||"",quantity:Number(p.quantity)||1,unitPrice:lineUnitPrice(p),discountType:p.discountType||"percent",discountValue:Number(p.discountValue)||0}))}});
+            if (result?.isError || !result?.structuredContent?.questionId) throw new Error((result?.content||[]).map(c=>c.text).join(" ")||"Could not create question");
+            questionId=result.structuredContent.questionId;
+            setMessages(current=>[...current,{id:questionId,question:text,status:"pending",answer:"",products:[]}]);
+            setQuestion("");
+            if (typeof app.sendMessage !== "function") throw new Error("This Claude Desktop host does not support widget-to-chat messages.");
+            await app.sendMessage({role:"user",content:[{type:"text",text:
+                `AE-initiated Revenue Workspace question. Workflow ID: ${workflowId}; question ID: ${questionId}. `+
+                `Call revenue_get_ae_question with these exact IDs. Answer the AE's question using verified Salesforce context. `+
+                `If the AE asks for product recommendations, find relevant products in the Agent Productivity Catalog and selected Price Book; `+
+                `only return verified Product2 IDs, and respect account-specific requirements and any explicit request to ignore Product Usage. `+
+                `Call revenue_submit_ai_answer with the workflowId, questionId, your answer, and optional products [{productId,reason}]. `+
+                `Do not change Salesforce or add products automatically. The widget will show your saved answer. `+
+                `The AE's question is: ${text}`
+            }]});
+        } catch(e) {
+            const reason=e?.message || String(e);
+            setError(`Claude Desktop handoff: ${reason}`);
+            if(questionId) {
+                try { await app.callServerTool({name:"workspace_fail_ai_question",arguments:{workflowId,questionId,reason}}); }catch{}
+                setMessages(current=>current.map(m=>m.id===questionId?{...m,status:"failed",answer:reason}:m));
+            }
+        } finally {setSending(false);}
+    }
+    async function addSuggested(item) {
+        setAdding(item.productId);
+        try {await onAddSuggestedProduct({product:{id:item.productId,name:item.name}});}
+        finally {setAdding("");}
+    }
+    return <section className="ae-chat-section" aria-label="Ask Claude AI">
+        <button className="ae-chat-toggle" type="button" onClick={()=>setOpen(v=>!v)}>
+            <span>✦ Ask Claude AI <small>Questions, pricing and product recommendations</small></span><span>{open?"Hide":"Show"}</span>
+        </button>
+        {open ? <div className="ae-chat-body">
+            <p className="muted">Claude responds through your Claude Desktop conversation and saves answers here. Only the AE can add suggested products to the quote.</p>
+            <div className="ae-chat-history" role="log" aria-live="polite">
+                {messages.length === 0 ? <p className="muted">Ask why a product is recommended, request a comparison, or ask for alternatives.</p> : null}
+                {messages.map(m=><div key={m.id} className="ae-chat-exchange">
+                    <div className="ae-chat-question"><strong>AE</strong><p>{m.question}</p></div>
+                    <div className="ae-chat-answer"><strong>Claude</strong><p>{m.status==="pending"?"Waiting for Claude Desktop to answer. You may need to approve the conversation request in Claude.":m.answer||"No answer saved."}</p>
+                    {(m.products||[]).map(item=><div key={item.productId} className="ae-chat-product">
+                        <div><strong>{item.name}</strong><p>{item.reason}</p><span className="muted">List unit price: {money(item.unitPrice)}</span></div>
+                        {selectedProductIds.has(item.productId)?<Badge tone="success">Added</Badge>:<Button disabled={Boolean(adding)} onClick={()=>addSuggested(item)}>{adding===item.productId?"Adding…":"Add to Quote"}</Button>}
+                    </div>)}
+                    </div>
+                </div>)}
+            </div>
+            {error?<Alert tone="warning">{error}</Alert>:null}
+            <form className="ae-chat-compose" onSubmit={sendQuestion}>
+                <textarea value={question} onChange={e=>setQuestion(e.target.value)} maxLength={2000} rows={3} placeholder="Ask Claude about this account, products, pricing, or recommendations…" aria-label="Ask Claude AI question" />
+                <Button type="submit" variant="primary" disabled={sending||!question.trim()}>{sending?"Sending…":"Ask Claude"}</Button>
+            </form>
+        </div>:null}
+    </section>;
 }
 
 function ReviewView({ requirements, salesforce, selection, products, busy, onBack, onCreateQuote }) {

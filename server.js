@@ -2599,6 +2599,147 @@ function registerRevenueWorkspaceApp(server) {
     console.error("Registered MCP Apps: prepare_quote_workspace, show_revenue_workspace");
 }
 
+
+/* =========================================================
+   IN-WORKSPACE AE / CLAUDE CHAT
+   Separate persistence so workflow save_state cannot overwrite chat.
+   Claude is invoked by the host after an explicit AE Send action.
+   ========================================================= */
+const AE_CHAT_DIRECTORY = path.join(TOKEN_DIRECTORY, "ae-chat");
+const AE_CHAT_STATUS = new Set(["pending", "answered", "failed"]);
+function aeChatFile(workflowId) {
+    const safeId = String(workflowId || "").trim().replace(/[^a-zA-Z0-9._-]/g, "_");
+    if (!safeId || safeId === "workflow") throw new Error("A valid workflow ID is required.");
+    return path.join(AE_CHAT_DIRECTORY, `${safeId}.json`);
+}
+async function readAeChat(workflowId) {
+    try { return JSON.parse(await fs.readFile(aeChatFile(workflowId), "utf8")); }
+    catch (error) { if (error?.code === "ENOENT") return { messages: [] }; throw error; }
+}
+async function writeAeChat(workflowId, chat) {
+    await fs.mkdir(AE_CHAT_DIRECTORY, { recursive: true });
+    const target = aeChatFile(workflowId);
+    const temp = `${target}.${process.pid}.tmp`;
+    await fs.writeFile(temp, JSON.stringify(chat, null, 2), "utf8");
+    await fs.rename(temp, target);
+}
+async function getAeChatContext(workflowId) {
+    const state = await readWorkflowState(workflowId);
+    if (!state?.data) throw new Error("Workspace workflow not found.");
+    const data = state.data;
+    const account = data.salesforce?.account || data.salesforce?.accountInsights?.account;
+    const quote = data.selection?.quote || {};
+    const requested = data.requirements?.products || [];
+    const selected = quoteSelectedProducts(data);
+    return { state, context: {
+        workflowId,
+        account: { id: account?.id || null, name: account?.name || data.requirements?.accountName || null },
+        requirements: { products: requested, excluded: data.requirements?.excluded || [], notes: String(data.requirements?.notes || "").slice(0, 1500) },
+        quote: { pricebookId: quote.pricebookId || data.salesforce?.pricebook?.id || null,
+            products: selected.map(item => ({ productId: item.productId || null, name: item.name, quantity: item.quantity, unitPrice: item.unitPrice, discountType: item.discountType, discountValue: item.discountValue })) },
+        usageSummary: (data.salesforce?.accountInsights?.productHistory || []).slice(0, 80).map(x => ({
+            productId: x.productId, productName: x.productName, status: x.status, lastUsageAmount: x.lastUsageAmount,
+            lastUsagePeriod: x.lastUsagePeriod, trend: x.trend
+        }))
+    }};
+}
+async function verifyAeProductRecommendations(context, products) {
+    if (!Array.isArray(products) || !products.length) return [];
+    const pricebookId = context.quote.pricebookId;
+    if (!/^[a-zA-Z0-9]{15,18}$/.test(String(pricebookId || ""))) return [];
+    const { productIds: catalogIds } = await getCatalogProductIds();
+    const selectedIds = new Set(context.quote.products.map(x => x.productId).filter(Boolean));
+    const excluded = context.requirements.excluded;
+    const valid = [];
+    const seen = new Set();
+    for (const item of products.slice(0, 10)) {
+        const id = String(item.productId || "");
+        if (!/^[a-zA-Z0-9]{15,18}$/.test(id) || !catalogIds.has(id) || seen.has(id) || selectedIds.has(id)) continue;
+        const entries = await soql(
+            `SELECT Id, Product2Id, Product2.Name, Product2.Family, UnitPrice ` +
+            `FROM PricebookEntry WHERE Product2Id = '${escapeSoql(id)}' ` +
+            `AND Pricebook2Id = '${escapeSoql(pricebookId)}' AND IsActive = true ` +
+            `AND Product2.IsActive = true LIMIT 1`
+        );
+        const entry = entries[0];
+        if (!entry || productIsExplicitlyExcluded(entry.Product2?.Name, entry.Product2?.Family, excluded)) continue;
+        valid.push({ productId: id, name: entry.Product2?.Name || "Product", pricebookEntryId: entry.Id,
+            unitPrice: Number(entry.UnitPrice), reason: String(item.reason || "Relevant Salesforce product for AE review.").slice(0, 500) });
+        seen.add(id);
+    }
+    return valid;
+}
+function registerAeWorkspaceChatTools(server) {
+    const appSchema = { _meta: appToolMeta(), annotations: { readOnlyHint: false, destructiveHint: false } };
+    registerAppTool(server, "workspace_ask_claude", {
+        ...appSchema, title: "Ask Claude from Revenue Workspace",
+        description: "Save an AE-authored question within the current workspace without changing Salesforce.",
+        inputSchema: z.object({ workflowId: z.string().min(1), question: z.string().trim().min(1).max(2000), draftProducts: z.array(z.object({ productId:z.string().nullable().optional(), name:z.string(), quantity:z.number(), unitPrice:z.number().optional(), discountType:z.string().optional(), discountValue:z.number().optional() })).max(200).optional() })
+    }, async ({workflowId, question, draftProducts}) => {
+        try {
+            await getAeChatContext(workflowId);
+            const chat = await readAeChat(workflowId);
+            const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+            chat.messages.push({ id, question, draftProducts: Array.isArray(draftProducts) ? draftProducts : null, status: "pending", createdAt: new Date().toISOString(), answer: "", products: [] });
+            chat.messages = chat.messages.slice(-100);
+            await writeAeChat(workflowId, chat);
+            return recommendationToolResponse("Question saved. Claude host handoff may now be requested by the AE.", { questionId: id, workflowId });
+        } catch(e) { return { isError:true, content:[{type:"text",text:e.message}] }; }
+    });
+    registerAppTool(server, "workspace_get_ai_messages", {
+        ...appSchema, annotations:{readOnlyHint:true,destructiveHint:false}, title:"Read AE AI Chat",
+        description:"Return saved Claude responses for the current Revenue Workspace.",
+        inputSchema: z.object({ workflowId:z.string().min(1) })
+    }, async ({ workflowId }) => {
+        try {
+            await getAeChatContext(workflowId);
+            return recommendationToolResponse("AE chat loaded.", await readAeChat(workflowId));
+        } catch(e) { return {isError:true,content:[{type:"text",text:e.message}]}; }
+    });
+    registerAppTool(server, "workspace_fail_ai_question", {
+        ...appSchema, title:"Mark Unavailable AI Chat Request", description:"Mark a host handoff failure without touching Salesforce.",
+        inputSchema:z.object({workflowId:z.string().min(1),questionId:z.string().min(1),reason:z.string().max(500)})
+    }, async ({workflowId,questionId,reason}) => {
+        const chat=await readAeChat(workflowId);
+        const m=chat.messages.find(x=>x.id===questionId);
+        if(m?.status === "pending") {m.status="failed";m.answer=reason;await writeAeChat(workflowId,chat);}
+        return recommendationToolResponse("Request status updated.",{status:m?.status||"not_found"});
+    });
+    server.registerTool("revenue_get_ae_question", {
+        description:"Get a specific AE-authored question and verified Revenue Workspace context to answer inside the widget. Do not modify Salesforce.",
+        inputSchema:z.object({workflowId:z.string().min(1),questionId:z.string().min(1)}),
+        annotations:{readOnlyHint:true}
+    }, async ({workflowId,questionId}) => {
+        try {
+            const chat=await readAeChat(workflowId);
+            const msg=chat.messages.find(m=>m.id===questionId);
+            if(!msg) throw new Error("Question not found in this workflow.");
+            const {context}=await getAeChatContext(workflowId);
+            if (msg.draftProducts) context.quote.products = msg.draftProducts;
+            return recommendationToolResponse("AE question and Salesforce workspace context.",{questionId,question:msg.question,context});
+        } catch(e) {return {isError:true,content:[{type:"text",text:e.message}]};}
+    });
+    server.registerTool("revenue_submit_ai_answer", {
+        description:"Save a Claude-generated AE answer inside the current Revenue Workspace. Optional products must use real Salesforce Product2 IDs. Does not modify Salesforce records.",
+        inputSchema:z.object({ workflowId:z.string().min(1), questionId:z.string().min(1),
+            answer:z.string().trim().min(1).max(10000), products:z.array(z.object({
+                productId:z.string().min(15), reason:z.string().max(500).optional()
+            })).max(10).optional() }), annotations:{readOnlyHint:false,destructiveHint:false}
+    }, async ({workflowId,questionId,answer,products=[]}) => {
+        try {
+            const chat=await readAeChat(workflowId);
+            const msg=chat.messages.find(m=>m.id===questionId);
+            if(!msg || !AE_CHAT_STATUS.has(msg.status)) throw new Error("Question not found in this workflow.");
+            const {context}=await getAeChatContext(workflowId);
+            if (msg.draftProducts) context.quote.products = msg.draftProducts;
+            const verified=await verifyAeProductRecommendations(context,products);
+            msg.answer=answer;msg.products=verified;msg.status="answered";msg.answeredAt=new Date().toISOString();
+            await writeAeChat(workflowId,chat);
+            return recommendationToolResponse("Answer saved in the widget. AE may add verified products to draft selection.",{workflowId,questionId,validatedProducts:verified.length});
+        } catch(e) {return {isError:true,content:[{type:"text",text:e.message}]};}
+    });
+}
+
 function createServer() {
     const server = new McpServer({
         name: "salesforce-headless-and-revenue-cloud-bridge",
@@ -2608,6 +2749,7 @@ function createServer() {
     registerRevenueWorkspaceApp(server);
     registerWorkspaceActionTools(server);
     registerClaudeRecommendationTools(server);
+    registerAeWorkspaceChatTools(server);
 
     server.registerTool(
         "read_account_transcript",
